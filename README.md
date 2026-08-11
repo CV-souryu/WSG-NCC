@@ -45,9 +45,9 @@ data/groups/group1/testset/cards/001.png
 ## 库 API
 
 ```python
-from cascade_ncc import (CascadeCodebook, CascadeShipRecognizer,
-                         build_cascade_codebook, load_cascade_codebook,
-                         recognize_cascade)
+from cascade_ncc import (CascadeCodebook, CascadeRecognizer,
+                         CascadeShipRecognizer, build_cascade_codebook,
+                         load_cascade_codebook, recognize_cascade)
 
 # 建库（自动缓存到 data/codebooks/<name>.npz）
 cb = build_cascade_codebook(gallery_paths, name="cascade")   # list[Path]
@@ -66,10 +66,12 @@ tops = r.recognize([img1, img2, ...], k=3)             # 批量 -> 每图一个�
 
 # 高层接口：码本（路径或 .npz 字节）+ 元数据 dict，返回 (值, 置信度, key)
 from cascade_ncc import CascadeRecognizer
-meta = {key: {"ship": "航母 226", "id": 226} for key in rec.keys}  # key = 相对构建目录路径
+rec = CascadeRecognizer(codebook_path_or_bytes)
+meta = {key: key.split("/")[-1] for key in rec.keys}   # key → 自定义泛型值
 rec = CascadeRecognizer(codebook_path_or_bytes, meta=meta)
-top = rec.recognize(img_rgba_u8, k=3)   # [(meta值或None, 置信度, key), ...]
-#   key 形如 "1/226/XM_NORMAL_226.png"（相对 gallery 根目录）
+top = rec.recognize(img_rgba_u8, k=3)   # [(值或None, 置信度, key), ...]
+#   key 形如 "1/226/XM_NORMAL_226.png"（相对 gallery 根目录，即构建目录）
+#   完整元数据（key → {shipIndex, title}）可由 ship_names.json 生成
 ```
 
 - **查询输入**：文件路径，或 `(H, W, 3/4)` 的 uint8 numpy 数组（RGB 或 RGBA），
@@ -119,8 +121,9 @@ data/
 │   │   ├── gallery/        原图库（1/ 2/ 2B/，共 3362 张）
 │   │   └── testset/        测试集（cards/ + screens/ + alignment.json + summary.json）
 │   └── group2/             预留第二组
+├── codebooks/              命名码本 .npz（cascade.npz 等，gitignored）
 ├── ship_names.json         全局船名映射
-└── fonts/                  生成用素材（gitignored）
+└── gallery_meta.json       识别元数据（key → {shipIndex, title}，自动生成）
 ```
 
 **新增一组**：建 `data/groups/group2/{gallery,testset}`，放入数据后用
@@ -144,7 +147,9 @@ name="cascade-group2")` 重建码本。注意码本记录的是**绝对路径**�
 │   └── cli.py                   # cascade-ncc 命令行入口
 ├── data/
 │   ├── groups/group1/           # 原图库 + 测试集（见「数据组织」）
-│   └── codebooks/               # 命名码本 .npz（cascade.npz 等，gitignored）
+│   ├── codebooks/               # 命名码本 .npz（cascade.npz 等，gitignored）
+│   ├── ship_names.json          # 全局船名映射
+│   └── gallery_meta.json        # 识别元数据（key → {shipIndex, title}）
 ├── tests/
 │   ├── conftest.py              # 夹具 + 共享 helper（合成卡图）
 │   ├── test_cpu.py              # CPU 底层 primitives 测试（无 GPU/数据依赖）
