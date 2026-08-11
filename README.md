@@ -64,11 +64,11 @@ r = CascadeShipRecognizer("cascade", use_gpu=True)     # GPU 批量（wgpu），
 top = r.recognize(img_rgba_u8, k=3)                    # 单图 -> 一个结果列表
 tops = r.recognize([img1, img2, ...], k=3)             # 批量 -> 每图一个列表
 
-# 高层接口：码本（路径或 .npz 字节）+ 元数据 dict，返回 (值, 置信度)
+# 高层接口：码本（路径或 .npz 字节）+ 元数据 dict，返回 (值, 置信度, key)
 from cascade_ncc import CascadeRecognizer
 meta = {path: {"ship": "航母 226", "id": 226} for path in ...}   # path 用 rec.paths
 rec = CascadeRecognizer(codebook_path_or_bytes, meta=meta)
-top = rec.recognize(img_rgba_u8, k=3)        # [(meta值, 置信度), ...]
+top = rec.recognize(img_rgba_u8, k=3)   # [(meta值或None, 置信度, 匹配key), ...]
 ```
 
 - **查询输入**：文件路径，或 `(H, W, 3/4)` 的 uint8 numpy 数组（RGB 或 RGBA），

@@ -306,14 +306,16 @@ class CascadeRecognizer(Generic[T]):
     """High-level ship-card recognizer: codebook (path/bytes) + metadata dict.
 
     ``meta`` maps each gallery path (as a str) to an arbitrary value; the
-    recognizer returns that value alongside the confidence instead of the raw
-    gallery path. The codebook may be a name/path or the raw ``.npz`` bytes.
+    recognizer returns ``(value, confidence, key)`` per match — ``value`` is
+    ``meta[key]`` (or ``None`` when there is no metadata for the match) and
+    ``key`` is the matched gallery path. The codebook may be a name/path or
+    the raw ``.npz`` bytes.
 
     Usage::
 
         rec = CascadeRecognizer("data/codebooks/cascade.npz",
                                 {".../XM_NORMAL_226.png": "航母 226", ...})
-        top = rec.recognize(img_rgba_u8, k=3)     # [(value, confidence), ...]
+        top = rec.recognize(img_rgba_u8, k=3)     # [(value, conf, key), ...]
         tops = rec.recognize([img1, img2], k=3)   # list of those, one per image
     """
 
@@ -338,19 +340,20 @@ class CascadeRecognizer(Generic[T]):
         return self._paths
 
     def recognize(self, images, k: int | None = None):
-        """Recognize one or many images; returns (value, confidence) tuples.
+        """Recognize one or many images; returns (value, confidence, key).
 
-        A single input returns one list of top-k ``(value, confidence)``; a
-        list/tuple returns a list of those. ``value`` is ``meta[gallery_path]``,
-        or the gallery path string itself when there is no metadata for it.
+        A single input returns one list of top-k ``(value, confidence, key)``;
+        a list/tuple returns a list of those. ``value`` is ``meta[key]`` or
+        ``None`` when there is no metadata; ``key`` is the matched gallery path.
         """
         k = self.k if k is None else k
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
         results = self._rec.recognize(image_list, k=k)
-        out = [[(self._value(path), float(score))
+        out = [[(self._value(path), float(score), str(path))
                 for _, path, score in top] for top in results]
         return out[0] if single else out
 
-    def _value(self, path) -> T:
-        return self._meta.get(str(path), str(path))
+    def _value(self, path) -> T | None:
+        """The metadata value for a matched gallery path, or None when absent."""
+        return self._meta.get(str(path))
