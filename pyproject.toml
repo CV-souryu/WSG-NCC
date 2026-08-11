@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascade-ncc"
+version = "0.1.0"
+description = "Cascade ship-card recognition: color-histogram prune + sparse NCC on GPU"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# Cross-platform GPU via wgpu-native (Vulkan / Metal / DX12).
+gpu = [
+    "wgpu>=0.28,<0.33",
+]
+test = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+cascade-ncc = "cascade_ncc.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cascade_ncc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "gpu: wgpu kernel tests (skipped without a Vulkan/Metal/DX12 device)",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

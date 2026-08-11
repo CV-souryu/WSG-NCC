@@ -1,0 +1,58 @@
+"""Command-line entry point: ``cascade-ncc recognize``.
+
+Kept minimal on purpose — the library API is the primary interface. A ``build``
+subcommand or extra flags (``--top-n``, ``--shift-y``, ``--no-trim-blue``) can
+be added here later without touching the recognizer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from ._constants import K_DEFAULT
+from .recognizer import CascadeShipRecognizer
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cascade-ncc",
+        description="Cascade ship-card recognition "
+                    "(color-histogram prune + sparse NCC).")
+    sub = parser.add_subparsers(dest="command", required=True)
+    rec = sub.add_parser("recognize", help="recognize one or more card images")
+    rec.add_argument("images", nargs="+", help="image path(s)")
+    rec.add_argument("--codebook", default="cascade",
+                     help="codebook name or .npz path (default: cascade)")
+    rec.add_argument("--k", type=int, default=K_DEFAULT,
+                     help=f"top-k results per image (default: {K_DEFAULT})")
+    rec.add_argument("--backend", choices=("cpu", "gpu"), default="gpu",
+                     help="backend; gpu falls back to cpu when no GPU is "
+                          "available (default: gpu)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.command != "recognize":
+        _build_parser().print_usage(sys.stderr)
+        return 2
+    try:
+        rec = CascadeShipRecognizer(args.codebook,
+                                    use_gpu=(args.backend == "gpu"))
+        if len(args.images) == 1:
+            results = [rec.recognize(args.images[0], k=args.k)]
+        else:
+            results = rec.recognize(args.images, k=args.k)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for img, top in zip(args.images, results):
+        print(img)
+        for rank, (idx, path, score) in enumerate(top, start=1):
+            print(f"  {rank}.\t{path}\t{score:.4f}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

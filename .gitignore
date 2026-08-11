@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+artifacts/
+# Large binary data (images) + built codebooks are distributed separately;
+# keep the small metadata/docs tracked (ship_names.json, testset annotations,
+# data/groups/README.md).
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.otf
+data/codebooks/

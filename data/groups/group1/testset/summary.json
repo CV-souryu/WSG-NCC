@@ -1,0 +1,21 @@
+{
+  "format": "full material card; portrait plus lower text/name area",
+  "label_source": "validated 58-occurrence material-acceptance-multiframe.json",
+  "screen_count": 19,
+  "expected_occurrences": 58,
+  "sample_count": 58,
+  "missing_count": 0,
+  "missing": [],
+  "unique_names": 33,
+  "crop_shape": [
+    406,
+    192,
+    3
+  ],
+  "device": {
+    "serial": "127.0.0.1:16416",
+    "product": "Cetus",
+    "model": "CET-AL00"
+  },
+  "file_naming": "ASCII occurrence index; UTF-8 ship_name in manifest.jsonl"
+}

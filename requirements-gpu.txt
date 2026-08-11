@@ -1,0 +1,4 @@
+# GPU 加速（可选）：跨平台 wgpu（wgpu-native：Vulkan / Metal / DX12）
+# 一条命令：pip install -r requirements.txt -r requirements-gpu.txt
+# （等价于 pyproject 的 gpu extra：pip install -e ".[gpu]"）
+wgpu>=0.28,<0.33
