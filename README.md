@@ -111,8 +111,8 @@ top = rec.recognize(img_rgba_u8, k=3)   # [(值或None, 置信度, key), ...]
 
 ## 数据组织
 
-数据集按组归并，每组一个自洽的原图库 + 测试集（`data/groups/`，约定见
-`data/groups/README.md`）：
+**`data/` 整个 gitignore**——图片、码本、船名映射、测试集注解都随数据分发，不在仓库里。
+数据依赖的测试在缺数据时自动 skip。磁盘上的布局（约定见 `data/groups/README.md`）：
 
 ```
 data/
@@ -121,7 +121,7 @@ data/
 │   │   ├── gallery/        原图库（1/ 2/ 2B/，共 3362 张）
 │   │   └── testset/        测试集（cards/ + screens/ + alignment.json + summary.json）
 │   └── group2/             预留第二组
-├── codebooks/              命名码本 .npz（cascade.npz 等，gitignored）
+├── codebooks/              命名码本 .npz（cascade.npz 等）
 ├── ship_names.json         全局船名映射
 └── gallery_meta.json       识别元数据（key → {shipIndex, title}，自动生成）
 ```
@@ -145,11 +145,8 @@ name="cascade-group2")` 重建码本。注意码本记录的是**绝对路径**�
 │   ├── _gpu.py                  # 共享 wgpu 样板（设备/模块/管线/绑定/派发）
 │   ├── _constants.py            # 共享常量（画布尺寸、阈值、灰度权重）
 │   └── cli.py                   # cascade-ncc 命令行入口
-├── data/
-│   ├── groups/group1/           # 原图库 + 测试集（见「数据组织」）
-│   ├── codebooks/               # 命名码本 .npz（cascade.npz 等，gitignored）
-│   ├── ship_names.json          # 全局船名映射
-│   └── gallery_meta.json        # 识别元数据（key → {shipIndex, title}）
+├── data/                        # 整个 gitignored（图片/码本/船名映射，随数据分发）
+│   └── groups/group1/           # 原图库 + 测试集（见「数据组织」）
 ├── tests/
 │   ├── conftest.py              # 夹具 + 共享 helper（合成卡图）
 │   ├── test_cpu.py              # CPU 底层 primitives 测试（无 GPU/数据依赖）

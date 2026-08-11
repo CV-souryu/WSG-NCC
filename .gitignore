@@ -8,11 +8,6 @@ __pycache__/
 build/
 dist/
 artifacts/
-# Large binary data (images) + built codebooks are distributed separately;
-# keep the small metadata/docs tracked (ship_names.json, testset annotations,
-# data/groups/README.md).
-data/**/*.png
-data/**/*.jpg
-data/**/*.jpeg
-data/**/*.otf
-data/codebooks/
+# Full data tree (images, codebooks, ship-name map, annotations) is distributed
+# separately; data-dependent tests skip cleanly when it is absent.
+data/
