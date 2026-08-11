@@ -13,6 +13,7 @@ GpuSampler(gray, ncc_pool) for the exact NCC. Histogram/prune/NCC stay on CPU.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Generic, TypeVar
 
@@ -332,28 +333,35 @@ class CascadeRecognizer(Generic[T]):
                                           max_queries=max_queries,
                                           trim_blue=trim_blue, shift_y=shift_y,
                                           align=align)
+        # The match key is the gallery path RELATIVE to the shared gallery root
+        # (the codebook build directory) — short, readable, and unique even when
+        # bare filenames repeat across set/id subdirectories.
         self._paths = [str(p) for p in self._rec.cb.paths]
+        root = Path(os.path.commonpath(self._paths))
+        self._keys = [str(Path(p).relative_to(root)) for p in self._paths]
 
     @property
     def paths(self) -> list[str]:
-        """The gallery paths, in codebook order (meta lookup keys)."""
+        """The absolute gallery paths, in codebook order."""
         return self._paths
+
+    @property
+    def keys(self) -> list[str]:
+        """The match keys (gallery paths relative to the build directory)."""
+        return self._keys
 
     def recognize(self, images, k: int | None = None):
         """Recognize one or many images; returns (value, confidence, key).
 
         A single input returns one list of top-k ``(value, confidence, key)``;
         a list/tuple returns a list of those. ``value`` is ``meta[key]`` or
-        ``None`` when there is no metadata; ``key`` is the matched gallery path.
+        ``None`` when there is no metadata; ``key`` is the matched gallery path
+        relative to the codebook's build directory (e.g. ``1/226/XM_NORMAL_226.png``).
         """
         k = self.k if k is None else k
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
         results = self._rec.recognize(image_list, k=k)
-        out = [[(self._value(path), float(score), str(path))
-                for _, path, score in top] for top in results]
+        out = [[(self._meta.get(self._keys[idx]), float(score), self._keys[idx])
+                for idx, _, score in top] for top in results]
         return out[0] if single else out
-
-    def _value(self, path) -> T | None:
-        """The metadata value for a matched gallery path, or None when absent."""
-        return self._meta.get(str(path))

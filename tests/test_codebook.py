@@ -81,7 +81,8 @@ def test_cascade_recognizer_path_bytes_and_meta(tmp_path):
     blob = cb_path.read_bytes()
 
     rec = CascadeRecognizer(blob, use_gpu=False)
-    meta = {p: f"卡{i + 1}" for i, p in enumerate(rec.paths)}
+    assert rec.keys[0].endswith("card_0.png")   # key = relative to build dir
+    meta = {key: f"卡{i + 1}" for i, key in enumerate(rec.keys)}
     rec = CascadeRecognizer(blob, meta=meta, use_gpu=False)
     arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
     top = rec.recognize(arrs, k=1)
@@ -89,19 +90,19 @@ def test_cascade_recognizer_path_bytes_and_meta(tmp_path):
         value, conf, key = row[0]
         assert value == f"卡{i + 1}", f"card {i} got {value}"
         assert isinstance(conf, float)
-        assert key == rec.paths[i]
+        assert key == rec.keys[i]
 
     # from a path, with an object (dict) meta value
-    meta_obj = {p: {"idx": i} for i, p in enumerate(rec.paths)}
+    meta_obj = {key: {"idx": i} for i, key in enumerate(rec.keys)}
     rec2 = CascadeRecognizer(str(cb_path), meta=meta_obj, use_gpu=False)
     top2 = rec2.recognize(arrs[1], k=1)
     assert top2[0][0] == {"idx": 1}
 
-    # no meta -> value is None, key is the gallery path
+    # no meta -> value is None, key is the relative gallery path
     rec3 = CascadeRecognizer(blob, use_gpu=False)
     top3 = rec3.recognize(arrs[0], k=1)
     assert top3[0][0] is None
-    assert top3[0][2] == rec3.paths[0]
+    assert top3[0][2] == rec3.keys[0]
 
 
 def test_build_recognize_custom_canvas(tmp_path):
