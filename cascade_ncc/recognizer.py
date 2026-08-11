@@ -14,6 +14,7 @@ GpuSampler(gray, ncc_pool) for the exact NCC. Histogram/prune/NCC stay on CPU.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Generic, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -108,12 +109,15 @@ class CascadeShipRecognizer:
         tops = r.recognize([img1, img2, ...], k=3)      # batch -> list of lists
     """
 
-    def __init__(self, codebook: str | Path = "cascade",
+    def __init__(self, codebook: str | Path | bytes | CascadeCodebook = "cascade",
                  use_gpu: bool = True,
                  max_queries: int = MAX_QUERIES_DEFAULT,
                  trim_blue: bool | None = None, shift_y: int | None = None,
                  top_n: int = TOP_N_DEFAULT, align: str | None = None):
-        self.cb = load_cascade_codebook(codebook)
+        # A codebook may be a name/path, raw .npz bytes, or an already-loaded
+        # CascadeCodebook object.
+        self.cb = (codebook if isinstance(codebook, CascadeCodebook)
+                   else load_cascade_codebook(codebook))
         p = self.cb.params
         # Default the query preprocessing from the codebook's recorded params so
         # recognition auto-matches how the gallery was laid out. Explicit args
@@ -293,3 +297,60 @@ class CascadeShipRecognizer:
             outs.append([(int(idx[i, r]), self.cb.paths[int(idx[i, r])],
                           float(scores[i, r])) for r in range(k)])
         return outs
+
+
+T = TypeVar("T")
+
+
+class CascadeRecognizer(Generic[T]):
+    """High-level ship-card recognizer: codebook (path/bytes) + metadata dict.
+
+    ``meta`` maps each gallery path (as a str) to an arbitrary value; the
+    recognizer returns that value alongside the confidence instead of the raw
+    gallery path. The codebook may be a name/path or the raw ``.npz`` bytes.
+
+    Usage::
+
+        rec = CascadeRecognizer("data/codebooks/cascade.npz",
+                                {".../XM_NORMAL_226.png": "航母 226", ...})
+        top = rec.recognize(img_rgba_u8, k=3)     # [(value, confidence), ...]
+        tops = rec.recognize([img1, img2], k=3)   # list of those, one per image
+    """
+
+    def __init__(self, codebook: str | Path | bytes,
+                 meta: dict[str, T] | None = None,
+                 k: int = K_DEFAULT,
+                 use_gpu: bool = True,
+                 max_queries: int = MAX_QUERIES_DEFAULT,
+                 trim_blue: bool | None = None, shift_y: int | None = None,
+                 align: str | None = None):
+        self.k = k
+        self._meta = meta or {}
+        self._rec = CascadeShipRecognizer(codebook, use_gpu=use_gpu,
+                                          max_queries=max_queries,
+                                          trim_blue=trim_blue, shift_y=shift_y,
+                                          align=align)
+        self._paths = [str(p) for p in self._rec.cb.paths]
+
+    @property
+    def paths(self) -> list[str]:
+        """The gallery paths, in codebook order (meta lookup keys)."""
+        return self._paths
+
+    def recognize(self, images, k: int | None = None):
+        """Recognize one or many images; returns (value, confidence) tuples.
+
+        A single input returns one list of top-k ``(value, confidence)``; a
+        list/tuple returns a list of those. ``value`` is ``meta[gallery_path]``,
+        or the gallery path string itself when there is no metadata for it.
+        """
+        k = self.k if k is None else k
+        single = not isinstance(images, (list, tuple))
+        image_list = [images] if single else list(images)
+        results = self._rec.recognize(image_list, k=k)
+        out = [[(self._value(path), float(score))
+                for _, path, score in top] for top in results]
+        return out[0] if single else out
+
+    def _value(self, path) -> T:
+        return self._meta.get(str(path), str(path))

@@ -71,6 +71,36 @@ def test_recognize_cascade_returns_k(tmp_path):
     assert len({t[0] for t in top}) == 3   # distinct gallery indices
 
 
+def test_cascade_recognizer_path_bytes_and_meta(tmp_path):
+    """CascadeRecognizer: codebook (path/bytes) + meta dict -> (value, conf)."""
+    from cascade_ncc.recognizer import CascadeRecognizer
+    paths = _write_gallery(tmp_path, 4)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0, **_BUILD)
+    blob = cb_path.read_bytes()
+
+    rec = CascadeRecognizer(blob, use_gpu=False)
+    meta = {p: f"卡{i + 1}" for i, p in enumerate(rec.paths)}
+    rec = CascadeRecognizer(blob, meta=meta, use_gpu=False)
+    arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+    top = rec.recognize(arrs, k=1)
+    for i, row in enumerate(top):
+        assert row[0][0] == f"卡{i + 1}", f"card {i} got {row[0][0]}"
+        assert isinstance(row[0][1], float)
+
+    # from a path, with an object (dict) meta value
+    meta_obj = {p: {"idx": i} for i, p in enumerate(rec.paths)}
+    rec2 = CascadeRecognizer(str(cb_path), meta=meta_obj, use_gpu=False)
+    top2 = rec2.recognize(arrs[1], k=1)
+    assert top2[0][0] == {"idx": 1}
+
+    # no meta -> falls back to the gallery path string
+    rec3 = CascadeRecognizer(blob, use_gpu=False)
+    top3 = rec3.recognize(arrs[0], k=1)
+    assert top3[0][0] == rec3.paths[0]
+
+
 def test_build_recognize_custom_canvas(tmp_path):
     """A codebook on a non-default canvas (62x120) recognizes itself."""
     paths = _write_gallery(tmp_path, 4)

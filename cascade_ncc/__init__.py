@@ -16,7 +16,7 @@ from .codebook import (
     build_cascade_codebook,
     load_cascade_codebook,
 )
-from .recognizer import CascadeShipRecognizer, recognize_cascade
+from .recognizer import CascadeRecognizer, CascadeShipRecognizer, recognize_cascade
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -28,6 +28,7 @@ except PackageNotFoundError:  # not pip-installed (plain checkout)
 __all__ = [
     "ROOT",
     "CascadeCodebook",
+    "CascadeRecognizer",
     "CascadeShipRecognizer",
     "build_cascade_codebook",
     "load_cascade_codebook",

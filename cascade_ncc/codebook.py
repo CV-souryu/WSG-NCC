@@ -22,6 +22,7 @@ Example:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import time
 from dataclasses import dataclass
@@ -238,7 +239,10 @@ def build_cascade_codebook(
     return cb
 
 
-def load_cascade_codebook(name_or_path: str | Path) -> CascadeCodebook:
+def load_cascade_codebook(name_or_path: str | Path | bytes) -> CascadeCodebook:
+    """Load a codebook from a name, a .npz path, or the raw .npz bytes."""
+    if isinstance(name_or_path, bytes):
+        return _from_npz(np.load(io.BytesIO(name_or_path), allow_pickle=False))
     p = Path(name_or_path)
     if p.suffix != ".npz":
         p = CODEBOOK_DIR / f"{name_or_path}.npz"
