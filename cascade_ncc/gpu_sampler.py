@@ -32,11 +32,6 @@ fn rgba(px: u32) -> vec4<u32> {
     return vec4<u32>(px & 0xFFu, (px >> 8u) & 0xFFu, (px >> 16u) & 0xFFu, px >> 24u);
 }
 
-// Rec.601 luma of an unpacked pixel (dense histogram pre-pass helper).
-fn luma(c: vec4<u32>) -> f32 {
-    return 0.299 * f32(c.x) + 0.587 * f32(c.y) + 0.114 * f32(c.z);
-}
-
 // Bilinear blend of four corner values.
 fn bilin(v00: f32, v10: f32, v01: f32, v11: f32, wx: f32, wy: f32) -> f32 {
     return v00 * (1.0 - wx) * (1.0 - wy) + v10 * wx * (1.0 - wy)
@@ -89,7 +84,7 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
         if (qid < ndense) {
             let pt = dpts[qid];
             let r = f32(dpool - 1u) / 2.0;
-            var gsum = 0.0; var asum = 0.0; var rsum = 0.0; var gs2 = 0.0; var bs2 = 0.0;
+            var asum = 0.0; var rsum = 0.0; var gs2 = 0.0; var bs2 = 0.0;
             let inv = 1.0 / f32(dpool * dpool);
             for (var ky: u32 = 0u; ky < dpool; ky = ky + 1u) {
                 let oy = f32(ky) - r;
@@ -105,7 +100,6 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
                     let c10 = rgba(imgs[base + u32(y0) * width + u32(x1)]);
                     let c01 = rgba(imgs[base + u32(y1) * width + u32(x0)]);
                     let c11 = rgba(imgs[base + u32(y1) * width + u32(x1)]);
-                    gsum += bilin(luma(c00), luma(c10), luma(c01), luma(c11), wx, wy);
                     asum += bilin(f32(c00.w), f32(c10.w), f32(c01.w), f32(c11.w), wx, wy);
                     rsum += bilin(f32(c00.x), f32(c10.x), f32(c01.x), f32(c11.x), wx, wy);
                     gs2  += bilin(f32(c00.y), f32(c10.y), f32(c01.y), f32(c11.y), wx, wy);

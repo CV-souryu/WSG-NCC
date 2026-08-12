@@ -423,7 +423,8 @@ def build_cascade_codebook(
     s8r = []
     v8r = []
     for p in paths:
-        im = Image.open(p).convert("RGBA")
+        with Image.open(p) as src:
+            im = src.convert("RGBA")
         if im.size != (cw, ch):
             raise ValueError(
                 f"codebook build requires every gallery image at the canvas "

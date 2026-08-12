@@ -117,7 +117,8 @@ def _query(cb: CascadeCodebook, query: Path | np.ndarray,
         if arr.shape[2] == 3:
             arr = np.dstack([arr, np.full(arr.shape[:2], OPAQUE_ALPHA, np.uint8)])
     else:
-        arr = np.asarray(Image.open(query).convert("RGBA"))
+        with Image.open(query) as im:
+            arr = np.asarray(im.convert("RGBA"))
     cw, ch = _canvas(cb)
     pre = preprocess_card(arr, trim_blue, shift_y, cw=cw, ch=ch, align=align,
                           fit_width=fit_width, unmask=unmask)
@@ -369,7 +370,8 @@ class CascadeShipRecognizer:
     @staticmethod
     def _to_rgba(img) -> np.ndarray:
         if isinstance(img, (str, Path)):
-            return np.asarray(Image.open(img).convert("RGBA"))
+            with Image.open(img) as im:
+                return np.asarray(im.convert("RGBA"))
         arr = np.asarray(img)
         if arr.ndim == 2:
             arr = np.stack([arr] * 3, axis=-1)
