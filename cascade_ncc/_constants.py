@@ -3,7 +3,7 @@
 The canvas (``CW``/``CH``) is the *default*; a codebook records its own canvas
 in ``params`` and every recognizer path (CPU resize and the GPU ``wh_buf``
 kernel parameter) honors it. The other constants are baked into both the CPU
-path and the WGSL literals — keep the GPU kernels in sync: blue threshold ``+20``,
+path and the WGSL literals — keep the GPU kernels in sync: blue threshold ``+80``,
 ``127.5`` alpha, ``0.299/0.587/0.114`` luma, exact-NCC floor ``cnt >= 50.0``
 (``NCC_MIN_POINTS``) and variance guard ``1e-12`` (``NCC_VAR_EPS``), and the
 bbox empty marker ``0xFFFFFFFF`` (``BBOX_SENTINEL``). We do NOT inject these
@@ -14,7 +14,10 @@ tweak from silently drifting from the CPU path.
 import numpy as np
 
 CW, CH = 124, 240            # canvas after cover-resize
-BLUE_TRIM_THRESH = 20        # pixel is "blue border" iff B > R+20 and B > G+20
+# Pixel is "blue border" iff B > R+N and B > G+N. N=80 is tuned to the fixed
+# UI border color (~RGB 15/125/214, B-G=89): tight enough to stop trimming
+# pale-blue card art (B-G ~30-40) that used to be over-trimmed on some crops.
+BLUE_TRIM_THRESH = 80
 ALPHA_THRESH = 127.5         # pixel counts as valid iff alpha >= 127.5
 OPAQUE_ALPHA = 255           # alpha value for opaque (fully visible) pixels
 GRAY_W = (0.299, 0.587, 0.114)   # Rec.601 luma weights (match the WGSL literals)

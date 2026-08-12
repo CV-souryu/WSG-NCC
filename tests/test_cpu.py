@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from cascade_ncc._constants import BLUE_TRIM_THRESH
 from cascade_ncc.primitives import (
     _trim_blue,
     features_from_rgba,
@@ -54,8 +55,8 @@ def test_preprocess_card_trims_blue_border():
     assert not np.array_equal(trimmed, untrimmed)
     # blue bands are gone from the trimmed output's top rows
     top = trimmed[:3, :, :3].astype(int)
-    assert not ((top[:, :, 2] > top[:, :, 0] + 20)
-                & (top[:, :, 2] > top[:, :, 1] + 20)).any()
+    assert not ((top[:, :, 2] > top[:, :, 0] + BLUE_TRIM_THRESH)
+                & (top[:, :, 2] > top[:, :, 1] + BLUE_TRIM_THRESH)).any()
 
 
 def test_preprocess_card_shift_y_blank_top():

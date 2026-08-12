@@ -164,7 +164,7 @@ def hsl_hist(rgb: np.ndarray, v: np.ndarray, common: np.ndarray,
     return h
 
 
-def codebook_hist(cb: "CascadeCodebook", rgb: np.ndarray, v: np.ndarray,
+def codebook_hist(cb: CascadeCodebook, rgb: np.ndarray, v: np.ndarray,
                   normalize: bool = True) -> np.ndarray:
     """Build the codebook's configured HSL spatial histogram for a query."""
     p = cb.params

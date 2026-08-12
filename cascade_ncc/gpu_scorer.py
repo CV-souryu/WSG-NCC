@@ -81,7 +81,11 @@ fn prune_scores(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dbase = cell * color_bins;
         for (var c: u32 = 0u; c < color_bins; c = c + 1u) {
             let d = dbase + c;
-            let g = hist[j * hdim + d] * on;
+            // Column-major layout (uploaded transposed): for a fixed d,
+            // adjacent threads (adjacent gallery rows) read consecutive
+            // addresses, so each warp load fills cache lines instead of
+            // touching 32 scattered lines. The dot product is unchanged.
+            let g = hist[d * ng + j] * on;
             s = s + g * f32(feats[img * hdim + d]);
             n2 = n2 + g * g;
         }
@@ -273,7 +277,7 @@ class CascadeGpuScorer:
         self.select_pipe, self.select_bgl = self.pipelines["select_topk"]
         self.hist_buf = create_buffer(self.device, ng * HIST_DIM * 4)
         upload(self.device, self.hist_buf,
-              np.ascontiguousarray(cb.hist, np.float32).ravel())
+              np.ascontiguousarray(cb.hist.T, np.float32).ravel())
         self.samples_buf = create_buffer(self.device, ng * npts * 4)
         upload(self.device, self.samples_buf,
               np.ascontiguousarray(cb.samples8, np.uint8).ravel().astype(np.uint32))

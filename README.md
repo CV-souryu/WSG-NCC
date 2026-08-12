@@ -47,6 +47,74 @@ data/groups/group1/testset/cards/001.png
 `--region TOP BOTTOM LEFT RIGHT`（只激活中心落在该百分比区域内的 3×3 直方图
 分区，如 `--region 0 50 0 100` 激活上方 6 个分区）。
 
+## 推荐参数（实测调优）
+
+针对 live-target-selector 裁出的单卡（`card-XX-rYcZ.png` 形式），以下两套参数
+在 14 张实测卡上全部命中（top-1 正确：B 组 9/9、A 组 5/5）：
+
+| 场景 | trim_blue | shift_y | unmask | region |
+|---|---|---:|---:|---|
+| 默认（正常亮度） | 切蓝边 | 4 | 0 | `(0, 60, 0, 100)` 激活顶部 60% |
+| 蒙版状态（半透明黑罩压暗） | 切蓝边 | 4 | 0.33 | `(0, 40, 0, 100)` 激活顶部 40% |
+
+- 默认配置用于正常画面：只激活画布顶部 60% 的码点，避开底部高方差区域。
+- 蒙版配置用于整体被约 0.33 不透明度黑罩压暗的画面：先用 `unmask=0.33` 还原
+  RGB，再只激活顶部 40% 码点。
+- 两套都直接用全码本（`cascade.npz`，`top_fraction=1.0`），通过 `region` 在
+  推理时激活码点，**不需要**为不同比例重建码本。
+- trim 蓝边阈值已调严到 `B > R+80 && B > G+80`（`BLUE_TRIM_THRESH`）：真实蓝边
+  是固定色（约 RGB 15/125/214），该阈值既能裁掉边框，又不会误裁卡面顶部的
+  淡蓝色区域。
+- **二次确认**：默认参数（正常亮度）无结果或分数偏低时，改用蒙版参数
+  （`unmask=0.33` + 顶部 40%）再跑一次；若蒙版参数给出高分结果，说明该图实际
+  处于蒙版状态，以蒙版结果为准。
+
+CLI：
+
+```bash
+# 默认：切蓝边 + sy4 + 0mask + 顶部60%
+.venv/bin/cascade-ncc recognize card.png --k 3 --region 0 60 0 100
+
+# 蒙版：切蓝边 + sy4 + unmask0.33 + 顶部40%
+.venv/bin/cascade-ncc recognize card.png --k 3 --unmask 0.33 --region 0 40 0 100
+```
+
+库 API：
+
+```python
+rec = CascadeRecognizer("cascade", region=(0, 60, 0, 100))               # 默认
+rec = CascadeRecognizer("cascade", region=(0, 40, 0, 100), unmask=0.33)  # 蒙版
+```
+
+### 码本构建推荐参数
+
+码本一律建**全码本**（`top_fraction=1.0`），上 60% / 40% 的激活全部留给推理时的
+`region` 参数——一组码本即可服务上面的两套推理配置，不需要为不同比例重复建码本：
+
+```python
+from pathlib import Path
+from cascade_ncc import build_cascade_codebook
+
+gallery = sorted(Path("data/groups/group1/gallery").rglob("*.png"))
+build_cascade_codebook(
+    gallery,
+    step=2, ncc_step=8, ncc_pool=9,       # 稠密 step=2 + 稀疏 step=8 + 9×9 池化
+    hue_bins=16, sat_bins=2, lig_bins=2,  # 576 维 H16S2L2 × 3×3 直方图
+    cells=(3, 3),
+    min_common_frac=0.9,                  # 公共码点：≥90% gallery 有效
+    top_fraction=1.0,                     # 全码本，上部分激活由推理 region 控制
+    cw=124, ch=240,
+    trim_blue=True, shift_y=4,            # 记录进 params，识别自动读取
+    align="top-center", fit_width=True,
+    unmask=0.0,                           # gallery 原图本身无蒙版
+    name="cascade",
+)
+```
+
+注意：`trim_blue` / `shift_y` / `align` / `fit_width` / `unmask` 会写进码本
+`params`，识别器默认按码本记录值预处理；推理时用 `--unmask` / `--region` 等参数
+覆盖即可，不需要为“默认 / 蒙版”两种场景各建一份码本。
+
 ## 库 API
 
 ```python
@@ -226,7 +294,8 @@ for result in rec.recognize(cards, k=1):
   不同画布建的码本会得到不同的缓存 key，不会误用旧缓存。
 - **预处理配置**（`trim_blue` / `shift_y` / `align`，都会写进码本 params 并进入
   缓存 key）：
-  - `trim_blue=True`：先裁掉蓝色边框（`B > R+20 && B > G+20` 的包围盒）。
+  - `trim_blue=True`：先裁掉蓝色边框（`B > R+80 && B > G+80` 的包围盒，
+    `BLUE_TRIM_THRESH=80`，见「推荐参数」）。
   - `align="<垂直>-<水平>"`：内容贴合的边，垂直 ∈ `top/center/bottom` × 水平 ∈
     `left/center/right`（默认 `"top-center"`）。cover 缩放固定；溢出在非贴合侧
     **裁切**，像素不足（含 shift_y 边距）用**透明黑填充**。

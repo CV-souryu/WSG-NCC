@@ -161,7 +161,7 @@ def test_recognize_per_call_override(tmp_path):
                            trim_blue=False, shift_y=0, **_BUILD)
     rec = CascadeShipRecognizer(str(cb_path), use_gpu=False,
                                 trim_blue=False, shift_y=0)
-    kwargs = dict(region=(0, 50, 0, 100), unmask=0.0, fit_width=False)
+    kwargs = {"region": (0, 50, 0, 100), "unmask": 0.0, "fit_width": False}
     got = rec.recognize(paths[0], k=1, **kwargs)
     ref = CascadeShipRecognizer(str(cb_path), use_gpu=False,
                                 trim_blue=False, shift_y=0, **kwargs)

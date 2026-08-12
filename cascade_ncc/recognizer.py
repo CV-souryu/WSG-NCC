@@ -23,8 +23,6 @@ from PIL import Image
 
 from ._constants import (
     ALPHA_THRESH,
-    EPS,
-    GRAY_W,
     K_DEFAULT,
     MAX_QUERIES_DEFAULT,
     MIN_CONFIDENCE_DEFAULT,
@@ -119,7 +117,6 @@ def _query(cb: CascadeCodebook, query: Path | np.ndarray,
     pre = preprocess_card(arr, trim_blue, shift_y, cw=cw, ch=ch, align=align,
                           fit_width=fit_width, unmask=unmask)
     a = pre.astype(np.float32)
-    gray = GRAY_W[0] * a[..., 0] + GRAY_W[1] * a[..., 1] + GRAY_W[2] * a[..., 2]
     step = cb.params["step"]
     # dense grid: alpha + RGB pooled in ONE pass (dense gray is unused)
     d = _pooled_multi([a[..., 3], a[..., 0], a[..., 1], a[..., 2]],
@@ -222,12 +219,13 @@ class CascadeShipRecognizer:
     def _apply_gpu_config(self, g: dict) -> None:
         """Point the shared GPU core at this recognizer's config."""
         cfg = (bool(self.fit_width), float(self.unmask or 0.0),
-               self.region)
+               self.region, bool(self.trim_blue))
         if g.get("_cfg") == cfg:
             return
         pre, sd, sc = g["pre"], g["sd"], g["scorer"]
         pre.fit_width = bool(self.fit_width)
         pre.unmask = float(self.unmask or 0.0)
+        pre.trim_blue = bool(self.trim_blue)
         sd.set_region(self.region)
         sc.set_region(self.region)
         g["_cfg"] = cfg
