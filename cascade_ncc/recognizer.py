@@ -26,6 +26,7 @@ from ._constants import (
     GRAY_W,
     K_DEFAULT,
     MAX_QUERIES_DEFAULT,
+    MIN_CONFIDENCE_DEFAULT,
     OPAQUE_ALPHA,
     REFINE_NCC,
     SHIFT_Y_DEFAULT,
@@ -114,7 +115,8 @@ class CascadeShipRecognizer:
                  use_gpu: bool = True,
                  max_queries: int = MAX_QUERIES_DEFAULT,
                  trim_blue: bool | None = None, shift_y: int | None = None,
-                 top_n: int = TOP_N_DEFAULT, align: str | None = None):
+                 top_n: int = TOP_N_DEFAULT, align: str | None = None,
+                 min_confidence: float | None = MIN_CONFIDENCE_DEFAULT):
         # A codebook may be a name/path, raw .npz bytes, or an already-loaded
         # CascadeCodebook object.
         self.cb = (codebook if isinstance(codebook, CascadeCodebook)
@@ -132,6 +134,7 @@ class CascadeShipRecognizer:
         self.top_n = top_n
         self.use_gpu = use_gpu
         self.max_queries = max_queries
+        self.min_confidence = min_confidence
         self._gpu = None
         if use_gpu:
             try:
@@ -166,12 +169,20 @@ class CascadeShipRecognizer:
                                        device=device),
         }
 
-    def recognize(self, images, k: int = K_DEFAULT):
+    def recognize(self, images, k: int = K_DEFAULT,
+                  min_confidence: float | None = None):
         """Recognize one or many images; returns top-k per image.
 
         Each input is a (H, W, 3/4) uint8 numpy array or a file path. A single
         input returns one result list; a list/tuple returns a list of results.
+
+        ``min_confidence`` drops matches whose score is below the threshold
+        (per image, in rank order); an image whose top-1 is below it returns
+        an empty list. ``None`` falls back to the constructor's value
+        (``self.min_confidence``); constructor ``None`` disables filtering.
         """
+        if min_confidence is None:
+            min_confidence = self.min_confidence
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
         if self._gpu is not None:
@@ -183,6 +194,9 @@ class CascadeShipRecognizer:
             results = self._cpu_batch(image_list, k)
         else:
             results = [self._cpu_one(image_list[0], k)]
+        if min_confidence is not None:
+            results = [[m for m in top if m[2] >= min_confidence]
+                       for top in results]
         return results[0] if single else results
 
     def _cpu_one(self, img, k: int):
@@ -326,13 +340,15 @@ class CascadeRecognizer(Generic[T]):
                  use_gpu: bool = True,
                  max_queries: int = MAX_QUERIES_DEFAULT,
                  trim_blue: bool | None = None, shift_y: int | None = None,
-                 align: str | None = None):
+                 align: str | None = None,
+                 min_confidence: float | None = MIN_CONFIDENCE_DEFAULT):
         self.k = k
         self._meta = meta or {}
         self._rec = CascadeShipRecognizer(codebook, use_gpu=use_gpu,
                                           max_queries=max_queries,
                                           trim_blue=trim_blue, shift_y=shift_y,
-                                          align=align)
+                                          align=align,
+                                          min_confidence=min_confidence)
         # The match key is the gallery path RELATIVE to the shared gallery root
         # (the codebook build directory) — short, readable, and unique even when
         # bare filenames repeat across set/id subdirectories.
@@ -350,18 +366,25 @@ class CascadeRecognizer(Generic[T]):
         """The match keys (gallery paths relative to the build directory)."""
         return self._keys
 
-    def recognize(self, images, k: int | None = None):
+    def recognize(self, images, k: int | None = None,
+                  min_confidence: float | None = None):
         """Recognize one or many images; returns (value, confidence, key).
 
         A single input returns one list of top-k ``(value, confidence, key)``;
         a list/tuple returns a list of those. ``value`` is ``meta[key]`` or
         ``None`` when there is no metadata; ``key`` is the matched gallery path
         relative to the codebook's build directory (e.g. ``1/226/XM_NORMAL_226.png``).
+
+        ``min_confidence`` drops matches below the threshold; an image whose
+        top-1 is below it returns an empty list. ``None`` falls back to the
+        constructor's value; constructor ``None`` disables filtering.
         """
         k = self.k if k is None else k
+        if min_confidence is None:
+            min_confidence = self._rec.min_confidence
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
-        results = self._rec.recognize(image_list, k=k)
+        results = self._rec.recognize(image_list, k=k, min_confidence=min_confidence)
         out = [[(self._meta.get(self._keys[idx]), float(score), self._keys[idx])
                 for idx, _, score in top] for top in results]
         return out[0] if single else out

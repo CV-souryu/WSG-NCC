@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from ._constants import K_DEFAULT
+from ._constants import K_DEFAULT, MIN_CONFIDENCE_DEFAULT
 from .recognizer import CascadeShipRecognizer
 
 
@@ -26,6 +26,10 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="codebook name or .npz path (default: cascade)")
     rec.add_argument("--k", type=int, default=K_DEFAULT,
                      help=f"top-k results per image (default: {K_DEFAULT})")
+    rec.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE_DEFAULT,
+                     help=f"drop matches below this top-1 score; the image then "
+                          f"prints no results (default: {MIN_CONFIDENCE_DEFAULT}; "
+                          f"pass 0 to disable)")
     rec.add_argument("--backend", choices=("cpu", "gpu"), default="gpu",
                      help="backend; gpu falls back to cpu when no GPU is "
                           "available (default: gpu)")
@@ -41,9 +45,11 @@ def main(argv: list[str] | None = None) -> int:
         rec = CascadeShipRecognizer(args.codebook,
                                     use_gpu=(args.backend == "gpu"))
         if len(args.images) == 1:
-            results = [rec.recognize(args.images[0], k=args.k)]
+            results = [rec.recognize(args.images[0], k=args.k,
+                                     min_confidence=args.min_confidence)]
         else:
-            results = rec.recognize(args.images, k=args.k)
+            results = rec.recognize(args.images, k=args.k,
+                                    min_confidence=args.min_confidence)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -40,7 +40,8 @@ data/groups/group1/testset/cards/001.png
 ```
 
 参数：`--codebook`（名字解析到 `data/codebooks/<name>.npz`，或直接给 `.npz` 路径）、
-`--k`（每图 top-k）、`--backend`（`cpu` / `gpu`，gpu 不可用时自动回退）。
+`--k`（每图 top-k）、`--backend`（`cpu` / `gpu`，gpu 不可用时自动回退）、
+`--min-confidence`（低于该 top-1 分的不输出，默认 0.4；设 0 关闭过滤）。
 
 ## 库 API
 
@@ -95,6 +96,7 @@ CascadeShipRecognizer(
     shift_y=None,              # None = 从码本 params 读取
     top_n=20,                  # 粗筛候选数
     align=None,                # None = 从码本 params 读取
+    min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
 
@@ -104,6 +106,10 @@ CascadeShipRecognizer(
 - 单图输入：`[(gallery_index: int, gallery_path: Path, score: float), ...]`
 - 批量输入（`list` / `tuple`）：上面这个列表的列表，每张图一个。
 
+`recognize(images, k=3, min_confidence=0.4)`：低于阈值的匹配被丢弃，top-1 低于
+阈值时该图返回空列表 `[]`。`min_confidence` 不传时用构造函数的值，构造函数传
+`None` 关闭过滤（也可用 `min_confidence=0.0`）。
+
 ```python
 r = CascadeShipRecognizer("cascade", use_gpu=True)
 top = r.recognize(img_rgba_u8, k=3)          # 单图 -> 一个结果列表
@@ -111,7 +117,7 @@ tops = r.recognize([img1, img2, ...], k=3)   # 批量 -> 每图一个结果列�
 ```
 
 实例属性：`cb`（码本）、`trim_blue` / `shift_y` / `align`（生效的预处理配置）、
-`top_n`、`use_gpu`、`max_queries`。
+`top_n`、`use_gpu`、`max_queries`、`min_confidence`（阈值过滤）。
 
 #### CascadeRecognizer（高层识别器：码本 + 元数据）
 
@@ -121,7 +127,7 @@ tops = r.recognize([img1, img2, ...], k=3)   # 批量 -> 每图一个结果列�
 为 `None`）。
 
 ```python
-CascadeRecognizer(
+rec = CascadeRecognizer(
     codebook,                  # 名字 / .npz 路径 / bytes
     meta=None,                 # dict[key -> 任意值]，key 用相对路径
     k=3,                       # 默认 top-k
@@ -130,6 +136,7 @@ CascadeRecognizer(
     trim_blue=None,            # None = 从码本 params 读取
     shift_y=None,
     align=None,
+    min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
 
@@ -140,6 +147,10 @@ rec = CascadeRecognizer(codebook_path_or_bytes, meta=meta)
 top = rec.recognize(img_rgba_u8, k=3)   # [(值或None, 置信度, key), ...]
 tops = rec.recognize([img1, img2], k=3) # 批量 -> 每图一个 [(值, 置信度, key), ...]
 ```
+
+`rec.recognize(images, k=3, min_confidence=0.4)` 同样支持阈值过滤：低于 0.4 的
+匹配被丢弃，top-1 低于阈值时返回空列表。不传时用构造函数的值，构造函数传
+`None` 关闭过滤。
 
 属性：`paths`（gallery 绝对路径，码本顺序）、`keys`（对应的相对路径）。
 完整元数据（key → `{shipIndex, title}`）可由 `ship_names.json` 生成。
