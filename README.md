@@ -1,6 +1,6 @@
 # Cascade NCC（船卡识别）
 
-单工件级联识别：**512 维全局颜色直方图粗筛 + 稀疏 9x9 公共码点精确 NCC**，
+单工件级联识别：**576 维 H16S2L2 × 3×3 空间直方图粗筛 + 稀疏 9x9 公共码点精确 NCC**，
 全部打包进一个 `.npz` 码本。批量识别走 wgpu GPU（一份 WGSL shader 由 wgpu-native
 自动翻译到 Vulkan / Metal / DX12 并缓存编译产物；码本常驻 GPU、一次 dispatch），
 无 GPU 时自动回退 CPU。spiral / concentric / level 旧路径已全部删除，仅保留
@@ -41,7 +41,11 @@ data/groups/group1/testset/cards/001.png
 
 参数：`--codebook`（名字解析到 `data/codebooks/<name>.npz`，或直接给 `.npz` 路径）、
 `--k`（每图 top-k）、`--backend`（`cpu` / `gpu`，gpu 不可用时自动回退）、
-`--min-confidence`（低于该 top-1 分的不输出，默认 0.4；设 0 关闭过滤）。
+`--min-confidence`（低于该 top-1 分的不输出，默认 0.4；设 0 关闭过滤）、
+`--fit-width / --no-fit-width`（宽缩放 / cover，不传用码本 params）、
+`--unmask`（除以该因子还原被遮罩压暗的 RGB，0 显式关闭，不传用码本 params）、
+`--region TOP BOTTOM LEFT RIGHT`（只激活中心落在该百分比区域内的 3×3 直方图
+分区，如 `--region 0 50 0 100` 激活上方 6 个分区）。
 
 ## 库 API
 
@@ -53,17 +57,23 @@ from cascade_ncc import (CascadeCodebook, CascadeRecognizer,
 
 ### 函数式接口
 
-`build_cascade_codebook(paths, step=2, ncc_step=8, ncc_pool=9, bins=8,
-min_common_frac=0.9, top_fraction=0.8, cw=124, ch=240, trim_blue=True,
+`build_cascade_codebook(paths, step=2, ncc_step=8, ncc_pool=9,
+hue_bins=16, sat_bins=2, lig_bins=2, cells=(3,3), min_common_frac=0.9,
+top_fraction=0.8, cw=124, ch=240, trim_blue=True,
 shift_y=4, align="top-center", name=None, cache_path=None, force=False)`
 从 gallery 图片列表构建码本，返回 `CascadeCodebook`。给 `name` 会自动缓存到
 `data/codebooks/<name>.npz`；`cache_path` 可指定其它路径；`force=True` 强制重建。
+
+> **构建不缩放**：码本构建要求所有 gallery 图与画布 `cw × ch`（默认 `124 × 240`）
+> 完全同尺寸，否则直接报错——长宽比不一的图请先统一裁切/预处理到画布尺寸，
+> 而不是靠构建时的隐式拉伸（拉伸会让码点与查询预处理后的画布对不齐）。
 
 `load_cascade_codebook(name_or_path)` 按名字（如 `"cascade"`）、`.npz` 路径或
 `.npz` 原始 bytes 加载码本。
 
 `recognize_cascade(cb, query, k=3, top_n=20, trim_blue=True, shift_y=4,
-refine=50, align="top-center")` 纯 CPU 单图识别，返回
+refine=50, align="top-center", fit_width=False, unmask=0.0,
+region=None)` 纯 CPU 单图识别，返回
 `[(gallery_index, Path, score), ...]`，按分数从高到低。
 
 ### 公开类
@@ -73,9 +83,10 @@ refine=50, align="top-center")` 纯 CPU 单图识别，返回
 不直接构造，由 `build_cascade_codebook` / `load_cascade_codebook` 返回。常用字段：
 
 - `paths: list[Path]`——gallery 绝对路径，按码本内顺序。
-- `hist: np.ndarray`——每张 gallery 的 512 维颜色直方图（粗筛特征）。
+- `hist: np.ndarray`——每张 gallery 的 576 维 H16S2L2 × 3×3 空间直方图。
 - `samples8` / `valid8` / `common8` / `normed8`——稀疏 NCC 精确打分所需数据。
-- `params: dict`——构建参数（`step` / `ncc_step` / `ncc_pool` / `bins` /
+- `params: dict`——构建参数（`step` / `ncc_step` / `ncc_pool` /
+  `hue_bins` / `sat_bins` / `lig_bins` / `cells` /
   `cw` / `ch` / `trim_blue` / `shift_y` / `align` 等），识别器会从这里读默认值。
 
 ```python
@@ -96,6 +107,9 @@ CascadeShipRecognizer(
     shift_y=None,              # None = 从码本 params 读取
     top_n=20,                  # 粗筛候选数
     align=None,                # None = 从码本 params 读取
+    fit_width=None,            # None = 从码本 params 读取
+    unmask=None,               # None = 从码本 params 读取；0.0 显式关闭
+    region=None,               # (top, bottom, left, right) % 区域激活直方图分区
     min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
@@ -116,8 +130,9 @@ top = r.recognize(img_rgba_u8, k=3)          # 单图 -> 一个结果列表
 tops = r.recognize([img1, img2, ...], k=3)   # 批量 -> 每图一个结果列表
 ```
 
-实例属性：`cb`（码本）、`trim_blue` / `shift_y` / `align`（生效的预处理配置）、
-`top_n`、`use_gpu`、`max_queries`、`min_confidence`（阈值过滤）。
+实例属性：`cb`（码本）、`trim_blue` / `shift_y` / `align` / `fit_width` /
+`unmask`（生效的预处理配置）、`top_n`、`use_gpu`、`max_queries`、
+`min_confidence`（阈值过滤）。
 
 #### CascadeRecognizer（高层识别器：码本 + 元数据）
 
@@ -136,6 +151,9 @@ rec = CascadeRecognizer(
     trim_blue=None,            # None = 从码本 params 读取
     shift_y=None,
     align=None,
+    fit_width=None,            # None = 从码本 params 读取
+    unmask=None,               # None = 从码本 params 读取；0.0 显式关闭
+    region=None,               # (top, bottom, left, right) % 区域激活直方图分区
     min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
@@ -194,7 +212,11 @@ for result in rec.recognize(cards, k=1):
   单图与批量走完全相同的预处理。
 - **码本参数**（`build_cascade_codebook`）：`step=2` 稠密网格驱动直方图、
   `ncc_step=8` 稀疏子集 + `ncc_pool=9` 像素邻域做精确 NCC、
-  `bins=8`（→512 维直方图）、`top_fraction=0.8`（丢弃底部 20% 高方差区域）。
+  `hue_bins=16` / `sat_bins=2` / `lig_bins=2` × `cells=(3,3)`
+  （→576 维空间直方图）、`top_fraction=0.8`（丢弃底部 20% 高方差区域）。
+- **区域激活**：`region=(top, bottom, left, right)`（0–100，按画布百分比）只保留
+  中心落在该区域内的 3×3 分区桶；如 `(0, 50, 0, 100)` 激活上方 2 行共 6 个分区，
+  CPU/GPU 的直方图粗筛和稀疏 NCC 都只使用激活分区。
 - **画布可参数化**：`cw`/`ch`（默认 `124 × 240`）决定码点的采样画布，会写进码本
   `params` 并进入缓存 key；CPU 预处理与 GPU 内核都按码本里的画布 resize。用
   不同画布建的码本会得到不同的缓存 key，不会误用旧缓存。

@@ -102,6 +102,25 @@ def features_from_rgba(rgba, xs: np.ndarray, ys: np.ndarray,
     return samples, v >= ALPHA_THRESH
 
 
+def features_rgb_from_rgba(rgba, xs: np.ndarray, ys: np.ndarray,
+                           pixel_pool: int = 2,
+                           cw: int = CW, ch: int = CH):
+    """Sample pooled RGB (S,3) + alpha validity at code points."""
+    if isinstance(rgba, Image.Image):
+        rgba = np.asarray(rgba)
+    a = np.asarray(rgba)
+    if a.shape[2] == 3:
+        alpha = np.full(a.shape[:2], OPAQUE_ALPHA, dtype=np.uint8)
+        a = np.dstack([a, alpha])
+    r, g, b, v = _pooled_multi(
+        [a[..., 0].astype(np.float32), a[..., 1].astype(np.float32),
+         a[..., 2].astype(np.float32), a[..., 3].astype(np.float32)],
+        xs, ys, pixel_pool)
+    samples = np.stack([r, g, b], axis=1)
+    samples = np.clip(samples, 0, 255).astype(np.uint8)
+    return samples, v >= ALPHA_THRESH
+
+
 def _normalize(features: np.ndarray, common: np.ndarray) -> np.ndarray:
     """Mask to common code points, mean-center, unit-norm each row."""
     x = features[:, common].astype(np.float64)
@@ -164,14 +183,22 @@ def _align_codes(align: str) -> tuple[int, int]:
 
 def preprocess_card(arr: np.ndarray, trim_blue: bool = True,
                     shift_y: int = SHIFT_Y_DEFAULT, cw: int = CW,
-                    ch: int = CH, align: str = "top-center") -> np.ndarray:
-    """Cover-resize a card into cw x ch with configurable alignment.
+                    ch: int = CH, align: str = "top-center",
+                    fit_width: bool = False,
+                    unmask: float = 0.0) -> np.ndarray:
+    """Cover- or fit-width-resize a card into cw x ch with configurable alignment.
 
     ``trim_blue`` crops the blue border; ``align`` picks which edges the content
     sticks to (e.g. "top-center" = vertical top + horizontal center); ``shift_y``
     is an extra vertical offset. Cover scaling overflows on the non-aligned
     sides (cropped there) and any shortfall — including the shift_y margin —
     is transparent-filled. Mirrors the GPU ``fused_preprocess`` geometry.
+
+    ``fit_width=True`` scales by width only (scale = cw / w, height follows the
+    aspect ratio) instead of cover; overflow crops and shortfall is filled
+    transparent-black per ``align``/``shift_y``. ``unmask`` divides RGB by the
+    factor (1/``unmask``, clamped to 255) to undo a semi-transparent black
+    overlay of that opacity. Order is: trim blue -> resize -> unmask -> shift.
     """
     arr = np.asarray(arr)
     if arr.ndim == 2:
@@ -181,13 +208,21 @@ def preprocess_card(arr: np.ndarray, trim_blue: bool = True,
         arr = np.dstack([arr, alpha])
     if trim_blue:
         arr = _trim_blue(arr)
-    # cover-resize to cw x ch (PIL LANCZOS is faster on CPU than numpy bilinear)
+    # cover- or fit-width-resize to cw x ch (PIL LANCZOS on CPU)
     im = Image.fromarray(arr)
     w, h = im.size
-    scale = max(cw / w, ch / h)
+    if fit_width:
+        scale = cw / w
+    else:
+        scale = max(cw / w, ch / h)
     nw = max(1, round(w * scale))
     nh = max(1, round(h * scale))
     im = im.resize((nw, nh), Image.LANCZOS)
+    if unmask > 0:
+        arr = np.asarray(im, dtype=np.uint8)
+        rgb = arr[..., :3].astype(np.float32) / unmask
+        im = Image.fromarray(
+            np.dstack([np.clip(rgb, 0, 255).astype(np.uint8), arr[..., 3]]))
     halign, valign = _align_codes(align)
     # content top-left on the cw x ch canvas; negative => crop, positive => pad.
     # int(.. / 2) truncates toward zero, matching WGSL i32 division.

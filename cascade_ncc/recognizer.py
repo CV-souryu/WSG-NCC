@@ -7,7 +7,7 @@ The codebook (built/loaded via :mod:`cascade_ncc.codebook`) is consumed here:
   vectorized CPU batch, auto-fallback to CPU when no GPU is available.
 
 GPU path: CPU trim-blue -> GpuResize (batch cover-resize) -> shift_y ->
-dense GpuSampler(rgb, step) for the 512d histogram + sparse
+dense GpuSampler(rgb, step) for the 576d HSL 3x3 histogram + sparse
 GpuSampler(gray, ncc_pool) for the exact NCC. Histogram/prune/NCC stay on CPU.
 """
 
@@ -33,7 +33,13 @@ from ._constants import (
     TOP_N_DEFAULT,
 )
 from ._gpu import GPU_LOCK, GpuError
-from .codebook import CascadeCodebook, _canvas, global_hist, load_cascade_codebook
+from .codebook import (
+    CascadeCodebook,
+    _canvas,
+    codebook_hist,
+    load_cascade_codebook,
+    region_codebook,
+)
 from .codebook_match import match_codebook
 from .primitives import _pooled_multi, preprocess_card
 
@@ -45,20 +51,24 @@ _PREPROCESS_CACHE: dict = {}
 
 
 def _shared_preprocess(max_queries: int, width: int, height: int,
-                       trim_blue: bool = True, align: str = "top-center"):
+                       trim_blue: bool = True, align: str = "top-center",
+                       fit_width: bool = False, unmask: float = 0.0):
     """Return the process-wide GpuPreprocess for a canvas/config, shared by codebooks."""
     from .gpu_preprocess import GpuPreprocess
-    key = (max_queries, width, height, trim_blue, align)
+    key = (max_queries, width, height, trim_blue, align, fit_width, unmask)
     pre = _PREPROCESS_CACHE.get(key)
     if pre is None:
         pre = GpuPreprocess(max_images=max_queries, width=width, height=height,
-                            trim_blue=trim_blue, align=align)
+                            trim_blue=trim_blue, align=align,
+                            fit_width=fit_width, unmask=unmask)
         _PREPROCESS_CACHE[key] = pre
     return pre
 
 
 def _query(cb: CascadeCodebook, query: Path | np.ndarray,
-           trim_blue: bool, shift_y: int, align: str = "top-center"):
+           trim_blue: bool, shift_y: int, align: str = "top-center",
+           fit_width: bool = False,
+           unmask: float = 0.0):
     if isinstance(query, np.ndarray):
         arr = np.asarray(query)
         if arr.ndim == 2:
@@ -68,7 +78,8 @@ def _query(cb: CascadeCodebook, query: Path | np.ndarray,
     else:
         arr = np.asarray(Image.open(query).convert("RGBA"))
     cw, ch = _canvas(cb)
-    pre = preprocess_card(arr, trim_blue, shift_y, cw=cw, ch=ch, align=align)
+    pre = preprocess_card(arr, trim_blue, shift_y, cw=cw, ch=ch, align=align,
+                          fit_width=fit_width, unmask=unmask)
     a = pre.astype(np.float32)
     gray = GRAY_W[0] * a[..., 0] + GRAY_W[1] * a[..., 1] + GRAY_W[2] * a[..., 2]
     step = cb.params["step"]
@@ -77,20 +88,28 @@ def _query(cb: CascadeCodebook, query: Path | np.ndarray,
                       cb.xs, cb.ys, step)
     qv = d[0] >= ALPHA_THRESH
     rgb = np.stack([d[1], d[2], d[3]], axis=1)
-    f = global_hist(rgb, qv, cb.common, cb.params["bins"])
-    # sparse grid: gray + alpha for the exact NCC (ncc_pool pooled)
-    s = _pooled_multi([gray, a[..., 3]], cb.xs8, cb.ys8,
-                      cb.params["ncc_pool"])
-    q8 = np.clip(s[0], 0, 255).astype(np.uint8)
-    return q8.astype(np.float32), s[1] >= ALPHA_THRESH, f
+    f = codebook_hist(cb, rgb, qv)
+    # sparse grid: pooled RGB + alpha for the exact RGB NCC
+    s = _pooled_multi([a[..., 0], a[..., 1], a[..., 2], a[..., 3]],
+                      cb.xs8, cb.ys8, cb.params["ncc_pool"])
+    q8 = np.clip(np.stack([s[0], s[1], s[2]], axis=1), 0, 255) \
+        .astype(np.uint8).reshape(-1)
+    qv8 = np.repeat(s[3] >= ALPHA_THRESH, 3)
+    return q8.astype(np.float32), qv8, f
 
 
 def recognize_cascade(cb: CascadeCodebook, query: Path | np.ndarray,
                       k: int = K_DEFAULT, top_n: int = TOP_N_DEFAULT,
                       trim_blue: bool = True, shift_y: int = SHIFT_Y_DEFAULT,
-                      refine: int = REFINE_NCC, align: str = "top-center"):
+                      refine: int = REFINE_NCC, align: str = "top-center",
+                      fit_width: bool = False,
+                      unmask: float = 0.0,
+                      region: tuple[float, float, float, float] | None = None):
     """Return top-k (index, path, score) via histogram prune -> sparse NCC."""
-    q8, qv8, f = _query(cb, query, trim_blue, shift_y, align)
+    if region is not None:
+        cb = region_codebook(cb, region)
+    q8, qv8, f = _query(cb, query, trim_blue, shift_y, align,
+                        fit_width=fit_width, unmask=unmask)
     cand = np.argsort(cb.hist @ f)[::-1][:top_n]
     scores = match_codebook(cb.normed8[cand], cb.samples8[cand],
                             cb.valid8[cand], cb.common8,
@@ -116,11 +135,17 @@ class CascadeShipRecognizer:
                  max_queries: int = MAX_QUERIES_DEFAULT,
                  trim_blue: bool | None = None, shift_y: int | None = None,
                  top_n: int = TOP_N_DEFAULT, align: str | None = None,
+                 fit_width: bool | None = None,
+                 unmask: float | None = None,
+                 region: tuple[float, float, float, float] | None = None,
                  min_confidence: float | None = MIN_CONFIDENCE_DEFAULT):
         # A codebook may be a name/path, raw .npz bytes, or an already-loaded
         # CascadeCodebook object.
         self.cb = (codebook if isinstance(codebook, CascadeCodebook)
                    else load_cascade_codebook(codebook))
+        self.region = None if region is None else tuple(region)
+        if self.region is not None:
+            self.cb = region_codebook(self.cb, self.region)
         p = self.cb.params
         # Default the query preprocessing from the codebook's recorded params so
         # recognition auto-matches how the gallery was laid out. Explicit args
@@ -131,6 +156,10 @@ class CascadeShipRecognizer:
         self.shift_y = (p.get("shift_y", SHIFT_Y_DEFAULT) if shift_y is None
                         else shift_y)
         self.align = p.get("align", "top-center") if align is None else align
+        self.fit_width = (p.get("fit_width", False) if fit_width is None
+                          else fit_width)
+        self.unmask = (float(p.get("unmask") or 0.0) if unmask is None
+                       else float(unmask))
         self.top_n = top_n
         self.use_gpu = use_gpu
         self.max_queries = max_queries
@@ -159,9 +188,14 @@ class CascadeShipRecognizer:
         sd = GpuSampler(self.cb.xs, self.cb.ys, max_images=max_queries,
                         width=cw, height=ch, device=device)
         sd.set_common(self.cb.common)   # codebook constant: upload once, persist
+        if self.cb.hist_mask is not None:
+            p = self.cb.params
+            color_bins = (p["hue_bins"] * p["sat_bins"] * p["lig_bins"])
+            sd.set_cell_mask(self.cb.hist_mask[::color_bins])
         return {
             "pre": _shared_preprocess(max_queries, cw, ch,
-                                      self.trim_blue, self.align),
+                                      self.trim_blue, self.align,
+                                      self.fit_width, self.unmask),
             "sd": sd,
             "ss": GpuSampler(self.cb.xs8, self.cb.ys8, max_images=max_queries,
                              width=cw, height=ch, device=device),
@@ -202,7 +236,8 @@ class CascadeShipRecognizer:
     def _cpu_one(self, img, k: int):
         return recognize_cascade(self.cb, img, k, self.top_n,
                                  self.trim_blue, self.shift_y,
-                                 align=self.align)
+                                 align=self.align, fit_width=self.fit_width,
+                                 unmask=self.unmask)
 
     def _cpu_batch(self, image_list, k: int):
         """Vectorized CPU recognition for many images (shared code points)."""
@@ -212,32 +247,25 @@ class CascadeShipRecognizer:
         cw, ch = _canvas(cb)
         arrs = np.stack([preprocess_card(self._to_rgba(img), self.trim_blue,
                                          self.shift_y, cw=cw, ch=ch,
-                                         align=self.align)
+                                         align=self.align,
+                                         fit_width=self.fit_width,
+                                         unmask=self.unmask)
                          for img in image_list])
         a = arrs.astype(np.float32)
-        gray = GRAY_W[0] * a[..., 0] + GRAY_W[1] * a[..., 1] + GRAY_W[2] * a[..., 2]
         # dense: alpha + RGB pooled across the whole batch in one pass
         d = _pooled_multi([a[..., 3], a[..., 0], a[..., 1], a[..., 2]],
                           cb.xs, cb.ys, p["step"])
         qv = d[0] >= ALPHA_THRESH
         rgb = np.stack([d[1], d[2], d[3]], axis=-1)          # (M, P, 3)
-        bins = p["bins"]
-        shift = round(np.log2(256 // bins))
-        qb = (rgb.astype(np.int64) >> shift)
-        feats = np.zeros((m, bins ** 3), np.float32)
-        for i in range(m):
-            idx = np.nonzero(cb.common & qv[i])[0]
-            if len(idx):
-                flat = (qb[i][idx, 0] * bins * bins
-                        + qb[i][idx, 1] * bins + qb[i][idx, 2])
-                feats[i] = np.bincount(flat, minlength=bins ** 3)
-        fn = np.linalg.norm(feats, axis=1, keepdims=True)
-        feats = feats / np.maximum(fn, EPS)
+        feats = np.stack([codebook_hist(cb, rgb[i], qv[i])
+                          for i in range(m)])
         kth = min(self.top_n, cb.hist.shape[0])   # small codebooks: keep all
         cand = np.argpartition(feats @ cb.hist.T, -kth, axis=1)[:, -self.top_n:]
-        s = _pooled_multi([gray, a[..., 3]], cb.xs8, cb.ys8, p["ncc_pool"])
-        q8 = np.clip(s[0], 0, 255).astype(np.uint8)
-        qv8 = s[1] >= ALPHA_THRESH
+        s = _pooled_multi([a[..., 0], a[..., 1], a[..., 2], a[..., 3]],
+                          cb.xs8, cb.ys8, p["ncc_pool"])
+        q8 = np.clip(np.stack([s[0], s[1], s[2]], axis=-1), 0, 255) \
+            .astype(np.uint8).reshape(m, -1)
+        qv8 = np.repeat(s[3] >= ALPHA_THRESH, 3, axis=1)
         outs = []
         for i in range(m):
             c = cand[i]
@@ -274,7 +302,6 @@ class CascadeShipRecognizer:
     def _gpu_batch_locked(self, image_list, k: int):
         g = self._gpu
         p = self.cb.params
-        bins = p["bins"]
         pre, sd, ss, sc = g["pre"], g["sd"], g["ss"], g["scorer"]
         arrs = [self._to_rgba(img) for img in image_list]
         m = len(arrs)
@@ -297,7 +324,7 @@ class CascadeShipRecognizer:
         sd.enqueue_sample_all(p3, pre.out_buf, ss.pts_buf, sd.common_buf,
                               sd.num_points, ss.num_points,
                               dpool=p["step"], spool=p["ncc_pool"],
-                              bins=bins, m=m)
+                              m=m)
         p3.end()
         p4 = encoder.begin_compute_pass()
         sc.enqueue_prune(p4, sd, m, k, self.top_n)
@@ -341,6 +368,9 @@ class CascadeRecognizer(Generic[T]):
                  max_queries: int = MAX_QUERIES_DEFAULT,
                  trim_blue: bool | None = None, shift_y: int | None = None,
                  align: str | None = None,
+                 fit_width: bool | None = None,
+                 unmask: float | None = None,
+                 region: tuple[float, float, float, float] | None = None,
                  min_confidence: float | None = MIN_CONFIDENCE_DEFAULT):
         self.k = k
         self._meta = meta or {}
@@ -348,6 +378,8 @@ class CascadeRecognizer(Generic[T]):
                                           max_queries=max_queries,
                                           trim_blue=trim_blue, shift_y=shift_y,
                                           align=align,
+                                          fit_width=fit_width, unmask=unmask,
+                                          region=region,
                                           min_confidence=min_confidence)
         # The match key is the gallery path RELATIVE to the shared gallery root
         # (the codebook build directory) — short, readable, and unique even when

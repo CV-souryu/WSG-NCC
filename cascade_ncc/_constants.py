@@ -26,7 +26,13 @@ NCC_VAR_EPS = 1e-12          # variance floor inside the exact-NCC ratio (CPU & 
 REFINE_NCC = 50              # top-N candidates re-scored by the exact NCC
 BBOX_SENTINEL = 0xFFFFFFFF   # empty-bbox marker (bbox_batch kernel init/guard)
 
-HIST_DIM = 512               # BINS**3 dense color histogram
+HUE_BINS = 16                # hue histogram bins
+SAT_BINS = 2                 # saturation histogram bins
+LIG_BINS = 2                 # lightness histogram bins
+HIST_CELLS_X = 3             # spatial histogram grid columns
+HIST_CELLS_Y = 3             # spatial histogram grid rows
+HIST_CELLS = HIST_CELLS_X * HIST_CELLS_Y
+HIST_DIM = HUE_BINS * SAT_BINS * LIG_BINS * HIST_CELLS   # 16*2*2*9 = 576
 MAX_CANDIDATES = 512         # threadgroup top-N candidate arrays (bounds topn/k,
                              # NOT the sparse point count — that is unbounded)
 
@@ -34,7 +40,6 @@ MAX_CANDIDATES = 512         # threadgroup top-N candidate arrays (bounds topn/k
 STEP = 2                     # dense-grid spacing (px)
 NCC_STEP = 8                 # sparse NCC subset stride (px)
 NCC_POOL = 9                 # sparse code-point pooling neighborhood (px)
-BINS = 8                     # per-channel histogram bins -> HIST_DIM
 TOP_FRACTION = 0.8           # keep this top fraction of rows (drop bottom noise)
 MIN_COMMON_FRAC = 0.9        # code point is "common" if >= this fraction of gallery has it
 

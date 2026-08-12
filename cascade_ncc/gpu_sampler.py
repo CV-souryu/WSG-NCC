@@ -1,10 +1,11 @@
 """Fused code-point sampling for the cascade: dense histogram + sparse NCC.
 
 One WGSL kernel (``sample_all``) reads the processed 124x240 image buffer and
-in a single dispatch samples the dense code points into the 512-bin color
-histogram and the sparse (9x9-pooled) code points into gray/valid for the
-exact NCC. No standalone run/rgb methods and no redundant dense buffers —
-only what the cascade's one-command-buffer pipeline needs.
+in a single dispatch samples the dense code points into the 576-bin
+H16S2L2 3x3 spatial color histogram and the sparse (9x9-pooled) code points
+into RGB/valid for the exact RGB NCC. No standalone run/rgb methods and no
+redundant dense buffers — only what the cascade's one-command-buffer pipeline
+needs.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ fn rgba(px: u32) -> vec4<u32> {
     return vec4<u32>(px & 0xFFu, (px >> 8u) & 0xFFu, (px >> 16u) & 0xFFu, px >> 24u);
 }
 
-// Rec.601 luma of an unpacked pixel.
+// Rec.601 luma of an unpacked pixel (dense histogram pre-pass helper).
 fn luma(c: vec4<u32>) -> f32 {
     return 0.299 * f32(c.x) + 0.587 * f32(c.y) + 0.114 * f32(c.z);
 }
@@ -47,11 +48,20 @@ fn bilin(v00: f32, v10: f32, v01: f32, v11: f32, wx: f32, wy: f32) -> f32 {
 @group(0) @binding(2) var<storage, read>      spts: array<vec2<f32>>;
 @group(0) @binding(3) var<storage, read>      cmn: array<u32>;
 @group(0) @binding(4) var<storage, read_write> hist: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> sgray: array<u32>;
+@group(0) @binding(5) var<storage, read_write> srgb: array<u32>;
 @group(0) @binding(6) var<storage, read_write> svalid: array<u32>;
 @group(0) @binding(7) var<storage, read>      sp: array<u32>;
+@group(0) @binding(8) var<storage, read>      cact: array<u32>;
 
-var<workgroup> shist: array<atomic<u32>, 512u>;
+const HUE_BINS: u32 = 16u;
+const SAT_BINS: u32 = 2u;
+const LIG_BINS: u32 = 2u;
+const CELLS_X: u32 = 3u;
+const CELLS_Y: u32 = 3u;
+const COLOR_BINS: u32 = 64u;
+const NB: u32 = 576u;
+
+var<workgroup> shist: array<atomic<u32>, 576u>;
 
 // One threadgroup per image-chunk: dense points fill the workgroup histogram,
 // then ONE thread flushes it into the global per-image histogram. The sparse
@@ -64,8 +74,7 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
     let ltid = ltid_v.x;
     let nimg = sp[0]; let ndense = sp[1]; let nsparse = sp[2];
     let width = sp[3]; let height = sp[4];
-    let dpool = sp[5]; let spool = sp[6]; let bins = sp[7]; let shift = sp[8];
-    let NB = 512u;
+    let dpool = sp[5]; let spool = sp[6];
     let chunks_d = (ndense + 255u) / 256u;
     let chunks_s = (nsparse + 255u) / 256u;
     let chunks_img = chunks_d + chunks_s;
@@ -105,11 +114,37 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
                 }
             }
             let v = select(0u, 1u, asum * inv >= 127.5);
-            if (cmn[qid] != 0u && v == 1u) {
-                let R = u32(clamp(rsum * inv, 0.0, 255.0));
-                let G = u32(clamp(gs2 * inv, 0.0, 255.0));
-                let B = u32(clamp(bs2 * inv, 0.0, 255.0));
-                let bin = (R >> shift) * bins * bins + (G >> shift) * bins + (B >> shift);
+            let cx = min(u32(floor(pt.x * 3.0 / f32(width))), CELLS_X - 1u);
+            let cy = min(u32(floor(pt.y * 3.0 / f32(height))), CELLS_Y - 1u);
+            let cidx = cy * CELLS_X + cx;
+            if (cmn[qid] != 0u && v == 1u && cact[cidx] != 0u) {
+                let R = f32(clamp(rsum * inv, 0.0, 255.0));
+                let G = f32(clamp(gs2 * inv, 0.0, 255.0));
+                let B = f32(clamp(bs2 * inv, 0.0, 255.0));
+                let rf = R * (1.0 / 255.0);
+                let gf = G * (1.0 / 255.0);
+                let bf = B * (1.0 / 255.0);
+                let mx = max(max(rf, gf), bf);
+                let mn = min(min(rf, gf), bf);
+                let d = mx - mn;
+                let ll = (mx + mn) * 0.5;
+                var hh = 0.0; var ss = 0.0;
+                if (d > 0.0) {
+                    ss = d / max(1.0 - abs(2.0 * ll - 1.0), 1e-6);
+                    if (mx == rf) {
+                        hh = (gf - bf) / d;
+                        if (hh < 0.0) { hh = hh + 6.0; }
+                    } else if (mx == gf) {
+                        hh = (bf - rf) / d + 2.0;
+                    } else {
+                        hh = (rf - gf) / d + 4.0;
+                    }
+                }
+                let hb = u32(floor(hh * 16.0 / 6.0)) % HUE_BINS;
+                let sb = min(u32(floor(ss * 2.0)), SAT_BINS - 1u);
+                let lb = min(u32(floor(ll * 2.0)), LIG_BINS - 1u);
+                let color = hb * (SAT_BINS * LIG_BINS) + sb * LIG_BINS + lb;
+                let bin = (cy * CELLS_X + cx) * COLOR_BINS + color;
                 atomicAdd(&shist[bin], 1u);
             }
         }
@@ -125,7 +160,7 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
         if (sq < nsparse) {
             let pt = spts[sq];
             let r = f32(spool - 1u) / 2.0;
-            var gsum = 0.0; var asum = 0.0;
+            var rsum = 0.0; var gs2 = 0.0; var bs2 = 0.0; var asum = 0.0;
             let inv = 1.0 / f32(spool * spool);
             for (var ky: u32 = 0u; ky < spool; ky = ky + 1u) {
                 let oy = f32(ky) - r;
@@ -141,12 +176,20 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
                     let c10 = rgba(imgs[base + u32(y0) * width + u32(x1)]);
                     let c01 = rgba(imgs[base + u32(y1) * width + u32(x0)]);
                     let c11 = rgba(imgs[base + u32(y1) * width + u32(x1)]);
-                    gsum += bilin(luma(c00), luma(c10), luma(c01), luma(c11), wx, wy);
+                    rsum += bilin(f32(c00.x), f32(c10.x), f32(c01.x), f32(c11.x), wx, wy);
+                    gs2  += bilin(f32(c00.y), f32(c10.y), f32(c01.y), f32(c11.y), wx, wy);
+                    bs2  += bilin(f32(c00.z), f32(c10.z), f32(c01.z), f32(c11.z), wx, wy);
                     asum += bilin(f32(c00.w), f32(c10.w), f32(c01.w), f32(c11.w), wx, wy);
                 }
             }
-            sgray[img * nsparse + sq] = u32(clamp(gsum * inv, 0.0, 255.0));
-            svalid[img * nsparse + sq] = select(0u, 1u, asum * inv >= 127.5);
+            let sq3 = (img * nsparse + sq) * 3u;
+            srgb[sq3 + 0u] = u32(clamp(rsum * inv, 0.0, 255.0));
+            srgb[sq3 + 1u] = u32(clamp(gs2 * inv, 0.0, 255.0));
+            srgb[sq3 + 2u] = u32(clamp(bs2 * inv, 0.0, 255.0));
+            let sv = select(0u, 1u, asum * inv >= 127.5);
+            svalid[sq3 + 0u] = sv;
+            svalid[sq3 + 1u] = sv;
+            svalid[sq3 + 2u] = sv;
         }
     }
 }
@@ -161,7 +204,7 @@ fn clear_hist(@builtin(workgroup_id) gid_v: vec3<u32>,
               @builtin(local_invocation_id) ltid_v: vec3<u32>) {
     let img = gid_v.x;
     let ltid = ltid_v.x;
-    let NB = 512u;
+    let NB = 576u;
     for (var i: u32 = ltid; i < NB; i = i + 256u) {
         atomicStore(&chist[img * NB + i], 0u);
     }
@@ -196,7 +239,7 @@ class GpuSampler:
              "sample_all": ["read-only-storage", "read-only-storage",
                             "read-only-storage", "read-only-storage",
                             "storage", "storage", "storage",
-                            "read-only-storage"]},
+                            "read-only-storage", "read-only-storage"]},
             "GPU sampler")
         self.sa_pipeline, self.sa_bgl = self.pipelines["sample_all"]
         self.ch_pipeline, self.ch_bgl = self.pipelines["clear_hist"]
@@ -208,11 +251,20 @@ class GpuSampler:
         self.hist_buf = create_buffer(
             self.device, max_images * HIST_DIM * 4)
         self.common_buf = None   # lazy: only the dense sampler fills it (set_common)
-        self.sa_sgray_buf = create_buffer(
-            self.device, max_images * MAX_CANDIDATES * 4)   # grows on demand
+        self.sa_srgb_buf = create_buffer(
+            self.device, max_images * MAX_CANDIDATES * 3 * 4)  # grows on demand
         self.sa_svalid_buf = create_buffer(
-            self.device, max_images * MAX_CANDIDATES * 4)
-        self.sa_params_buf = create_buffer(self.device, 36)
+            self.device, max_images * MAX_CANDIDATES * 3 * 4)
+        self.sa_params_buf = create_buffer(self.device, 28)
+        self.cell_active_buf = create_buffer(self.device, 9 * 4)
+        upload(self.device, self.cell_active_buf, np.ones(9, np.uint32))
+
+    def set_cell_mask(self, mask: np.ndarray) -> None:
+        """Activate only the given 3x3 spatial cells (row-major, 9 values)."""
+        arr = np.asarray(mask, np.uint8).ravel().astype(np.uint32)
+        if arr.size != 9:
+            raise ValueError("cell mask must have 9 entries (3x3)")
+        upload(self.device, self.cell_active_buf, arr)
 
     def set_common(self, common: np.ndarray) -> None:
         """Fill the dense common-mask buffer (this sampler owns it).
@@ -241,30 +293,29 @@ class GpuSampler:
 
     def enqueue_sample_all(self, pass_, img_buf, spts_buf, common_buf,
                            ndense, nsparse, dpool, spool,
-                           bins=8, shift=None, m=1):
+                           m=1):
         """Dispatch fused sample_all into an existing compute pass.
 
         Reads the processed image from ``img_buf`` (the preprocess output, no
         CPU round-trip); dense points (self.pts_buf) -> ``hist_buf``, sparse
-        points (``spts_buf``) -> ``sa_sgray_buf`` / ``sa_svalid_buf``.
+        points (``spts_buf``) -> ``sa_srgb_buf`` / ``sa_svalid_buf``
+        (each point stores R,G,B + 3 validity copies).
         """
-        if shift is None:
-            shift = round(np.log2(256 // bins))
-        # Sparse outputs are written at an `nsparse` stride per image, so the
-        # buffers must cover m*nsparse regardless of the initial MAX_CANDIDATES
-        # default (the sparse point count itself is unbounded).
-        need = m * nsparse * 4
-        if need > self.sa_sgray_buf.size:
-            self.sa_sgray_buf = create_buffer(self.device, need)
+        # Sparse outputs are written at an `nsparse*3` stride per image, so the
+        # buffers must cover m*nsparse*3 regardless of MAX_CANDIDATES.
+        need = m * nsparse * 3 * 4
+        if need > self.sa_srgb_buf.size:
+            self.sa_srgb_buf = create_buffer(self.device, need)
             self.sa_svalid_buf = create_buffer(self.device, need)
         # hist_buf is zeroed on the GPU by enqueue_clear_hist, not here.
         upload(self.device, self.sa_params_buf,
                np.asarray([m, ndense, nsparse, self.width, self.height,
-                           dpool, spool, bins, shift], np.uint32))
+                           dpool, spool], np.uint32))
         chunks_d = (ndense + 255) // 256
         chunks_s = (nsparse + 255) // 256
         enqueue(pass_, self.device, self.sa_pipeline, self.sa_bgl,
                 [img_buf, self.pts_buf, spts_buf, common_buf,
-                 self.hist_buf, self.sa_sgray_buf,
-                 self.sa_svalid_buf, self.sa_params_buf],
+                 self.hist_buf, self.sa_srgb_buf,
+                 self.sa_svalid_buf, self.sa_params_buf,
+                 self.cell_active_buf],
                 m * (chunks_d + chunks_s))

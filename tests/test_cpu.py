@@ -67,6 +67,25 @@ def test_preprocess_card_shift_y_blank_top():
     assert (out[4:, :, 3] == 255).all()
 
 
+def test_preprocess_card_unmask_lightens_rgb():
+    img = np.full((240, 124, 3), 100, np.uint8)
+    out = preprocess_card(img, trim_blue=False, shift_y=0, unmask=0.5)
+    assert out.shape == (240, 124, 4)
+    assert (out[..., :3] == 200).all()        # 100 / 0.5
+    assert (out[..., 3] == 255).all()         # alpha untouched
+
+
+def test_preprocess_card_trims_blue_before_unmask():
+    # Gray-blue border: raw colors are "blue", but after unmask=0.5 the
+    # threshold no longer sees blue — order must be trim first, then unmask.
+    img = np.full((240, 124, 3), 100, np.uint8)
+    img[:20, :] = (120, 120, 255)
+    img = np.dstack([img, np.full((240, 124), 255, np.uint8)])
+    out = preprocess_card(img, trim_blue=True, shift_y=0, unmask=0.5)
+    top = out[:3, 10:114, :3].astype(int)
+    assert (top == 200).all()                 # border cropped, 100 / 0.5
+
+
 def test_trim_blue_shared_helper():
     # No-op on a full-bleed image.
     gray = np.full((50, 50, 4), 128, np.uint8)

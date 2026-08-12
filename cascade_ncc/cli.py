@@ -33,6 +33,18 @@ def _build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--backend", choices=("cpu", "gpu"), default="gpu",
                      help="backend; gpu falls back to cpu when no GPU is "
                           "available (default: gpu)")
+    rec.add_argument("--fit-width", action=argparse.BooleanOptionalAction,
+                     default=None,
+                     help="scale query by width only (--fit-width) or cover "
+                          "(--no-fit-width); default: codebook params")
+    rec.add_argument("--unmask", type=float, default=None,
+                     help="divide RGB by this factor to undo a semi-transparent "
+                          "overlay; 0 disables (default: codebook params)")
+    rec.add_argument("--region", nargs=4, type=float, metavar=("TOP", "BOTTOM", "LEFT", "RIGHT"),
+                     default=None,
+                     help="activate only spatial histogram cells whose centers "
+                          "fall inside top/bottom/left/right %% of the canvas, "
+                          "e.g. --region 0 50 0 100 activates the top 6 of 9 cells")
     return parser
 
 
@@ -43,7 +55,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         rec = CascadeShipRecognizer(args.codebook,
-                                    use_gpu=(args.backend == "gpu"))
+                                    use_gpu=(args.backend == "gpu"),
+                                    fit_width=args.fit_width,
+                                    unmask=args.unmask,
+                                    region=(None if args.region is None
+                                            else tuple(args.region)))
         if len(args.images) == 1:
             results = [rec.recognize(args.images[0], k=args.k,
                                      min_confidence=args.min_confidence)]

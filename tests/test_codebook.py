@@ -10,12 +10,13 @@ from cascade_ncc._constants import SCORE_SENTINEL
 from cascade_ncc.codebook import (
     build_cascade_codebook,
     load_cascade_codebook,
+    region_codebook,
 )
 from cascade_ncc.codebook_match import match_codebook, normalize_common
 from cascade_ncc.recognizer import CascadeShipRecognizer, recognize_cascade
 from tests.conftest import _write_gallery
 
-_BUILD = {"step": 2, "ncc_step": 4, "ncc_pool": 3}   # small + fast, bins stays 8
+_BUILD = {"step": 2, "ncc_step": 4, "ncc_pool": 3}   # small + fast
 
 
 def _build(tmp_path, paths):
@@ -27,7 +28,7 @@ def test_build_roundtrip(tmp_path):
     paths = _write_gallery(tmp_path, 4)
     cb = _build(tmp_path, paths)
     cb2 = load_cascade_codebook(tmp_path / "cb.npz")
-    assert cb2.hist.shape == cb.hist.shape == (4, 512)
+    assert cb2.hist.shape == cb.hist.shape == (4, 576)
     assert cb2.samples8.shape == cb.samples8.shape
     assert cb2.common8.dtype == bool
     assert cb2.params == cb.params
@@ -107,7 +108,7 @@ def test_cascade_recognizer_path_bytes_and_meta(tmp_path):
 
 def test_build_recognize_custom_canvas(tmp_path):
     """A codebook on a non-default canvas (62x120) recognizes itself."""
-    paths = _write_gallery(tmp_path, 4)
+    paths = _write_gallery(tmp_path, 4, size=(62, 120))
     cb = build_cascade_codebook(paths, cache_path=tmp_path / "cb62.npz",
                                 cw=62, ch=120, **_BUILD)
     assert cb.params["cw"] == 62 and cb.params["ch"] == 120
@@ -118,6 +119,38 @@ def test_build_recognize_custom_canvas(tmp_path):
                                 trim_blue=False, shift_y=0)
         assert top[0][0] == i, f"card {i} top-1 mismatch: {top[0]}"
         assert top[0][1].resolve() == p.resolve()
+
+
+def test_recognizer_unmask_codebook_default_and_override(tmp_path):
+    """Recognizer defaults to codebook unmask; explicit 0.0 disables it."""
+    paths = _write_gallery(tmp_path, 2)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0, unmask=0.4, **_BUILD)
+    rec_default = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                        trim_blue=False, shift_y=0)
+    assert rec_default.unmask == 0.4
+    rec_override = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                         trim_blue=False, shift_y=0,
+                                         unmask=0.0)
+    assert rec_override.unmask == 0.0
+
+
+def test_region_activation_top50_buckets(tmp_path):
+    """Region (0,50,0,100) activates the top 2 rows (6 of 9 histogram cells)."""
+    paths = _write_gallery(tmp_path, 4)
+    cb = build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                                trim_blue=False, shift_y=0, **_BUILD)
+    rc = region_codebook(cb, (0, 50, 0, 100))
+    color_bins = 64
+    assert rc.hist_mask is not None and rc.hist_mask.shape == (576,)
+    assert rc.hist_mask[:6 * color_bins].all()
+    assert not rc.hist_mask[6 * color_bins:].any()
+    assert rc.common8.sum() < cb.common8.sum()
+    top = recognize_cascade(cb, paths[0], k=1, top_n=20,
+                            trim_blue=False, shift_y=0,
+                            region=(0, 50, 0, 100))
+    assert top[0][0] == 0
 
 
 def test_recognize_cascade_array_input(tmp_path):

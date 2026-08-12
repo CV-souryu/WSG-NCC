@@ -2,7 +2,8 @@
 
 The codebook is a single self-contained ``.npz``:
 
-- dense (step=2) code points drive a 512-dim global color histogram (pruner)
+- dense (step=2) code points drive a 576-dim H16S2L2 3x3 spatial histogram
+  (pruner)
 - a sparse (step=8) subset of those points drives the exact per-common-point
   NCC (refine) with a LARGER ncc_pool pixel neighborhood (9x9), so it is both
   ~12x cheaper than the full grid and robust to a few px of misalignment
@@ -25,20 +26,24 @@ import hashlib
 import io
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from ._constants import (
-    BINS,
     CH,
     CW,
     EPS,
+    HIST_CELLS_X,
+    HIST_CELLS_Y,
+    HUE_BINS,
+    LIG_BINS,
     MIN_COMMON_FRAC,
     NCC_POOL,
     NCC_STEP,
+    SAT_BINS,
     SHIFT_Y_DEFAULT,
     STEP,
     TOP_FRACTION,
@@ -47,6 +52,7 @@ from .primitives import (
     _normalize,
     _pooled_multi,
     features_from_rgba,
+    features_rgb_from_rgba,
     numpy_resize,
 )
 
@@ -81,17 +87,162 @@ def _pooled_rgb(rgba, xs: np.ndarray, ys: np.ndarray, step: int,
                      np.clip(b, 0, 255)], axis=1)
 
 
-def global_hist(rgb: np.ndarray, v: np.ndarray, common: np.ndarray,
-                bins: int = BINS) -> np.ndarray:
-    """L2-normalized bins^3 RGB histogram over common+valid code points."""
+def _hsl_bins(rgb: np.ndarray, hue_bins: int, sat_bins: int,
+              lig_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """HSL bin indices per pixel (hue, saturation, lightness), float32 math
+    matching the WGSL fused sampler."""
+    rgb = np.asarray(rgb, dtype=np.float32)
+    inv255 = np.float32(1.0 / 255.0)
+    r = rgb[..., 0] * inv255
+    g = rgb[..., 1] * inv255
+    b = rgb[..., 2] * inv255
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    d = mx - mn
+    l = (mx + mn) * np.float32(0.5)
+    h = np.zeros_like(l)
+    s = np.zeros_like(l)
+    six = np.float32(6.0)
+    two = np.float32(2.0)
+    four = np.float32(4.0)
+    one = np.float32(1.0)
+    nz = d > 0
+    if nz.any():
+        rn, gn, bn = r[nz], g[nz], b[nz]
+        mxn, dn, ln = mx[nz], d[nz], l[nz]
+        hh = np.where(
+            mxn == rn,
+            np.where(gn < bn, (gn - bn) / dn + six, (gn - bn) / dn),
+            np.where(mxn == gn, (bn - rn) / dn + two,
+                     (rn - gn) / dn + four))
+        h[nz] = hh
+        s[nz] = dn / np.maximum(one - np.abs(two * ln - one),
+                                np.float32(1e-6))
+    hb = (np.floor((h * np.float32(hue_bins)) / six).astype(np.int64)) % hue_bins
+    sb = np.clip(np.floor(s * np.float32(sat_bins)).astype(np.int64),
+                 0, sat_bins - 1)
+    lb = np.clip(np.floor(l * np.float32(lig_bins)).astype(np.int64),
+                 0, lig_bins - 1)
+    return hb, sb, lb
+
+
+def _cell_index(xs: np.ndarray, ys: np.ndarray, cw: int, ch: int,
+                cells_x: int, cells_y: int) -> np.ndarray:
+    """3x3 spatial cell index (row-major) for code-point positions."""
+    xs = np.asarray(xs, dtype=np.float32)
+    ys = np.asarray(ys, dtype=np.float32)
+    cx = np.minimum(((xs * np.float32(cells_x)) / np.float32(cw)).astype(np.int64),
+                    cells_x - 1)
+    cy = np.minimum(((ys * np.float32(cells_y)) / np.float32(ch)).astype(np.int64),
+                    cells_y - 1)
+    return cy * cells_x + cx
+
+
+def hsl_hist(rgb: np.ndarray, v: np.ndarray, common: np.ndarray,
+             xs: np.ndarray, ys: np.ndarray, cw: int, ch: int,
+             hue_bins: int = HUE_BINS, sat_bins: int = SAT_BINS,
+             lig_bins: int = LIG_BINS,
+             cells_x: int = HIST_CELLS_X, cells_y: int = HIST_CELLS_Y,
+             mask: np.ndarray | None = None,
+             normalize: bool = True) -> np.ndarray:
+    """L2-normalized H16S2L2 x 3x3 spatial histogram over common+valid points."""
+    color_bins = hue_bins * sat_bins * lig_bins
+    dim = color_bins * cells_x * cells_y
+    h = np.zeros(dim, np.float32)
     idx = np.nonzero(common & v)[0]
-    h = np.zeros(bins ** 3, np.float32)
     if len(idx):
-        qb = np.clip((rgb[idx] / (256.0 / bins)).astype(int), 0, bins - 1)
-        flat = qb[:, 0] * bins * bins + qb[:, 1] * bins + qb[:, 2]
-        h = np.bincount(flat, minlength=bins ** 3).astype(np.float32)
-    n = np.linalg.norm(h)
-    return h / n if n > EPS else h
+        hb, sb, lb = _hsl_bins(rgb[idx], hue_bins, sat_bins, lig_bins)
+        color = hb * (sat_bins * lig_bins) + sb * lig_bins + lb
+        ci = _cell_index(xs[idx], ys[idx], cw, ch, cells_x, cells_y)
+        flat = ci * color_bins + color
+        h = np.bincount(flat, minlength=dim).astype(np.float32)
+    if mask is not None:
+        h = h * np.asarray(mask, np.float32)
+    if normalize:
+        n = np.linalg.norm(h)
+        return h / n if n > EPS else h
+    return h
+
+
+def codebook_hist(cb: "CascadeCodebook", rgb: np.ndarray, v: np.ndarray,
+                  normalize: bool = True) -> np.ndarray:
+    """Build the codebook's configured HSL spatial histogram for a query."""
+    p = cb.params
+    cw, ch = _canvas(cb)
+    return hsl_hist(rgb, v, cb.common, cb.xs, cb.ys, cw, ch,
+                    p.get("hue_bins", HUE_BINS),
+                    p.get("sat_bins", SAT_BINS),
+                    p.get("lig_bins", LIG_BINS),
+                    *(tuple(p.get("cells", (HIST_CELLS_X, HIST_CELLS_Y)))),
+                    mask=getattr(cb, "hist_mask", None),
+                    normalize=normalize)
+
+
+def region_cell_mask(cb: CascadeCodebook,
+                     region: tuple[float, float, float, float]) -> np.ndarray:
+    """Row-major cell mask for (top, bottom, left, right) percentages.
+
+    A cell is active when its center is inside the region; e.g. top=0,
+    bottom=50 activates the top 2 rows (6 of 3x3 cells).
+    """
+    if len(region) != 4:
+        raise ValueError("region must be (top, bottom, left, right) in 0..100")
+    top, bottom, left, right = map(float, region)
+    if not (0 <= top < bottom <= 100 and 0 <= left < right <= 100):
+        raise ValueError("region must satisfy 0<=top<bottom<=100 and "
+                         "0<=left<right<=100")
+    p = cb.params
+    cells_x, cells_y = p["cells"]
+    cw, ch = _canvas(cb)
+    cy = (np.arange(cells_y) + 0.5) * ch / cells_y
+    cx = (np.arange(cells_x) + 0.5) * cw / cells_x
+    rows = (cy >= top / 100.0 * ch) & (cy <= bottom / 100.0 * ch)
+    cols = (cx >= left / 100.0 * cw) & (cx <= right / 100.0 * cw)
+    m = np.outer(rows, cols).ravel()
+    if not m.any():
+        raise ValueError("region activates no spatial histogram cells")
+    return m
+
+
+def region_point_mask(xs: np.ndarray, ys: np.ndarray, cw: int, ch: int,
+                      region: tuple[float, float, float, float]) -> np.ndarray:
+    """Exact per-point activation mask (canvas percentages, not cell-aligned)."""
+    if len(region) != 4:
+        raise ValueError("region must be (top, bottom, left, right) in 0..100")
+    top, bottom, left, right = map(float, region)
+    if not (0 <= top < bottom <= 100 and 0 <= left < right <= 100):
+        raise ValueError("region must satisfy 0<=top<bottom<=100 and "
+                         "0<=left<right<=100")
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    y0, y1 = ch * top / 100.0, ch * bottom / 100.0
+    x0, x1 = cw * left / 100.0, cw * right / 100.0
+    m = ((ys >= y0) & (ys <= y1) & (xs >= x0) & (xs <= x1))
+    if not m.any():
+        raise ValueError("region activates no sparse code points")
+    return m
+
+
+def region_codebook(cb: CascadeCodebook,
+                    region: tuple[float, float, float, float]) -> CascadeCodebook:
+    """Return a codebook view with inactive spatial histogram buckets zeroed."""
+    if region is None:
+        return cb
+    p = cb.params
+    color_bins = p["hue_bins"] * p["sat_bins"] * p["lig_bins"]
+    cell_mask = region_cell_mask(cb, region)
+    hist_mask = np.repeat(cell_mask, color_bins)
+    cw, ch = _canvas(cb)
+    sp_mask = region_point_mask(cb.xs8, cb.ys8, cw, ch, region)
+    common8 = cb.common8 & np.repeat(sp_mask, 3)
+    hist = cb.hist * hist_mask[None, :]
+    norms = np.linalg.norm(hist, axis=1, keepdims=True)
+    hist = np.divide(hist, np.maximum(norms, EPS),
+                     out=np.zeros_like(hist), where=norms > EPS)
+    return replace(cb, hist=hist,
+                   hist_mask=hist_mask,
+                   common8=common8,
+                   normed8=_normalize(cb.samples8, common8))
 
 
 def _geometry(step: int, ncc_step: int, top_fraction: float,
@@ -117,20 +268,21 @@ class CascadeCodebook:
     xs: np.ndarray            # dense grid positions (histogram)
     ys: np.ndarray
     common: np.ndarray        # dense common mask (histogram)
-    hist: np.ndarray          # (N, bins^3) gallery color histograms
+    hist: np.ndarray          # (N, HIST_DIM) gallery HSL spatial histograms
     xs8: np.ndarray           # sparse NCC positions
     ys8: np.ndarray
-    samples8: np.ndarray      # (N, S) sparse NCC samples (ncc_pool pooled)
-    valid8: np.ndarray        # (N, S) sparse NCC validity
-    common8: np.ndarray       # (S,) sparse NCC common mask
-    normed8: np.ndarray       # (N, S_common) normalized sparse NCC vectors
+    samples8: np.ndarray      # (N, S*3) sparse RGB NCC samples (R,G,B flat)
+    valid8: np.ndarray        # (N, S*3) sparse RGB NCC validity (per channel)
+    common8: np.ndarray       # (S*3,) sparse RGB NCC common mask
+    normed8: np.ndarray       # (N, C*3) normalized sparse RGB NCC vectors
     params: dict
+    hist_mask: np.ndarray | None = None    # 576-d bucket mask (region activation)
 
 
 def _cache_key(paths: list[Path], params: dict) -> str:
     payload = ("|".join(str(p.resolve()) for p in sorted(paths))
                + "|".join(f"{k}={params[k]}" for k in sorted(params))
-               + "|cascade1")
+               + "|cascade3")
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -167,7 +319,10 @@ def build_cascade_codebook(
     step: int = STEP,
     ncc_step: int = NCC_STEP,
     ncc_pool: int = NCC_POOL,
-    bins: int = BINS,
+    hue_bins: int = HUE_BINS,
+    sat_bins: int = SAT_BINS,
+    lig_bins: int = LIG_BINS,
+    cells: tuple[int, int] = (HIST_CELLS_X, HIST_CELLS_Y),
     min_common_frac: float = MIN_COMMON_FRAC,
     top_fraction: float = TOP_FRACTION,
     cw: int = CW,
@@ -175,6 +330,8 @@ def build_cascade_codebook(
     trim_blue: bool = True,
     shift_y: int = SHIFT_Y_DEFAULT,
     align: str = "top-center",
+    fit_width: bool = False,
+    unmask: float = 0.0,
     name: str | None = None,
     cache_path: Path | None = None,
     force: bool = False,
@@ -188,10 +345,15 @@ def build_cascade_codebook(
     auto-uses the same config instead of silently mismatching.
     """
     paths = [Path(p).resolve() for p in paths]
+    if cache_path is not None:
+        cache_path = Path(cache_path)
     params = {"step": step, "ncc_step": ncc_step, "ncc_pool": ncc_pool,
-              "bins": bins, "min_common_frac": min_common_frac,
+              "hue_bins": hue_bins, "sat_bins": sat_bins,
+              "lig_bins": lig_bins, "cells": list(cells),
+              "min_common_frac": min_common_frac,
               "top_fraction": top_fraction, "cw": cw, "ch": ch,
-              "trim_blue": trim_blue, "shift_y": shift_y, "align": align}
+              "trim_blue": trim_blue, "shift_y": shift_y, "align": align,
+              "fit_width": fit_width, "unmask": unmask}
     # Explicit cache_path wins; otherwise fall back to a named default.
     # (A bare ``or`` here parses wrong when name is None and silently disables
     # an explicit cache_path — keep the precedence explicit.)
@@ -207,27 +369,34 @@ def build_cascade_codebook(
     xs, ys, xs8, ys8 = _geometry(step, ncc_step, top_fraction, cw, ch)
     t0 = time.perf_counter()
     vrows = []
+    prows = []
     s8r = []
     v8r = []
     for p in paths:
         im = Image.open(p).convert("RGBA")
+        if im.size != (cw, ch):
+            raise ValueError(
+                f"codebook build requires every gallery image at the canvas "
+                f"size {cw}x{ch} (no resizing); {p} is "
+                f"{im.width}x{im.height}. Pre-crop/preprocess all images to "
+                f"{cw}x{ch} first.")
         _, v = features_from_rgba(im, xs, ys, step, cw, ch)      # dense validity
-        s8, v8 = features_from_rgba(im, xs8, ys8, ncc_pool, cw, ch)  # sparse NCC
+        s8, v8 = features_rgb_from_rgba(im, xs8, ys8, ncc_pool, cw, ch)
+        prows.append(_pooled_rgb(im, xs, ys, step, cw, ch))
         vrows.append(v.astype(np.uint8))
-        s8r.append(s8)
-        v8r.append(v8.astype(np.uint8))
+        s8r.append(s8.reshape(-1))
+        v8r.append(np.repeat(v8.astype(np.uint8), 3))
     valid = np.stack(vrows)
     common = valid.mean(axis=0) >= min_common_frac
-    hist = np.stack([global_hist(_pooled_rgb(Image.open(p).convert("RGBA"),
-                                             xs, ys, step, cw, ch),
-                                 valid[i], common, bins)
-                     for i, p in enumerate(paths)])
+    hist = np.stack([hsl_hist(prows[i], valid[i], common, xs, ys, cw, ch,
+                              hue_bins, sat_bins, lig_bins, *cells)
+                     for i in range(len(paths))])
     samples8 = np.stack(s8r)
     valid8 = np.stack(v8r)
     common8 = valid8.mean(axis=0) >= min_common_frac
     normed8 = _normalize(samples8, common8)
     print(f"cascade codebook built: {len(paths)} imgs, hist {hist.shape[1]}d, "
-          f"NCC {len(xs8)} pts/{int(common8.sum())} common "
+          f"NCC {len(xs8)} pts/{int(common8.sum())} common channels "
           f"({time.perf_counter() - t0:.1f}s)")
 
     cb = CascadeCodebook(paths, xs, ys, common, hist, xs8, ys8,

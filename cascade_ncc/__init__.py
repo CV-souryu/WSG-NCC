@@ -1,6 +1,6 @@
 """Cascade-only package: single-artifact cascade codebook + GPU recognizer.
 
-The whole pipeline is the cascade: a 512-dim global color-histogram pruner
+The whole pipeline is the cascade: a 576-dim HSL 3x3 spatial-histogram pruner
 (step-2 code points) + exact NCC on a sparse 9x9-pooled subset + top_fraction
 crop, all driven by one compact codebook and a fully GPU-resident batch
 recognizer (no spiral / concentric / level paths).

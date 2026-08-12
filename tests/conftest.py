@@ -34,19 +34,21 @@ def ship_name_of(path: Path) -> str:
     return SHIP_NAMES.get(base, path.parent.name)
 
 
-def _card_image(seed: int) -> np.ndarray:
+def _card_image(seed: int, size: tuple[int, int] = (124, 240)) -> np.ndarray:
     """Synthetic RGBA card: distinct random colors, fully opaque."""
+    w, h = size
     rng = np.random.RandomState(seed)
-    img = rng.randint(0, 256, (240, 124, 3), np.uint8)
-    return np.dstack([img, np.full((240, 124), 255, np.uint8)])
+    img = rng.randint(0, 256, (h, w, 3), np.uint8)
+    return np.dstack([img, np.full((h, w), 255, np.uint8)])
 
 
-def _write_gallery(tmp_path, n: int = 4) -> list:
+def _write_gallery(tmp_path, n: int = 4,
+                   size: tuple[int, int] = (124, 240)) -> list:
     """Write n synthetic cards into tmp_path; returns their paths."""
     paths = []
     for i in range(n):
         p = tmp_path / f"card_{i}.png"
-        Image.fromarray(_card_image(i)).save(p)
+        Image.fromarray(_card_image(i, size)).save(p)
         paths.append(p)
     return paths
 

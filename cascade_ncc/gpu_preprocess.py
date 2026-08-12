@@ -1,4 +1,4 @@
-"""Fused GPU preprocess: trim blue + cover-resize + shift + bottom crop.
+"""Fused GPU preprocess: trim blue + cover/fit-width resize + shift + crop.
 
 Two WGSL dispatches, no per-image CPU loops:
   1. ``bbox_batch``: one thread per source pixel atomically reduces each
@@ -40,6 +40,11 @@ struct ImgInfo { start: u32, w: u32, h: u32, count: u32 }
 // (R | G<<8 | B<<16 | A<<24) — see rgba()/pack_rgba().
 fn rgba(px: u32) -> vec4<u32> {
     return vec4<u32>(px & 0xFFu, (px >> 8u) & 0xFFu, (px >> 16u) & 0xFFu, px >> 24u);
+}
+
+fn unmask_gain(unmask_bits: u32) -> f32 {
+    let unmask = bitcast<f32>(unmask_bits);
+    return select(1.0, 1.0 / max(unmask, 1e-6), unmask > 0.0);
 }
 
 // bbox_batch bindings (b_ prefix: module-scope names must be unique).
@@ -113,11 +118,12 @@ fn fused_preprocess(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     let gid = gid_v.x;
     let W = f_wh[0]; let H = f_wh[1]; let shift_y = f_wh[2];
     let halign = f_wh[3]; let valign = f_wh[4];
+    let gain = unmask_gain(f_wh[6]);
     if (gid >= f_nimg[0] * W * H) { return; }
     let m = gid / (W * H);
     let rem = gid % (W * H);
     let oy = rem / W; let ox = rem % W;
-    // cover-resize geometry, in-kernel (matches the CPU preprocess_card).
+// cover- or fit-width-resize geometry, in-kernel (matches CPU preprocess_card).
     let src_start = f_img[m].start; let src_w = f_img[m].w; let src_h = f_img[m].h;
     var bx0 = f_bbox[m * 4u + 0u]; var by0 = f_bbox[m * 4u + 1u];
     var bx1 = f_bbox[m * 4u + 2u]; var by1 = f_bbox[m * 4u + 3u];
@@ -128,7 +134,9 @@ fn fused_preprocess(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     }
     let tw = bx1 - bx0 + 1u;
     let th = by1 - by0 + 1u;
-    let scale = max(f32(W) / f32(tw), f32(H) / f32(th));
+    let fit = f_wh[5] != 0u;
+    let scale = select(max(f32(W) / f32(tw), f32(H) / f32(th)),
+                       f32(W) / f32(tw), fit);
     let nw = max(1u, u32(round(f32(tw) * scale)));
     let nh = max(1u, u32(round(f32(th) * scale)));
     let invx = f32(tw) / f32(nw);
@@ -155,12 +163,12 @@ fn fused_preprocess(@builtin(global_invocation_id) gid_v: vec3<u32>) {
     let c01 = rgba(f_src[src_start + u32(y1) * src_w + u32(x0)]);
     let c11 = rgba(f_src[src_start + u32(y1) * src_w + u32(x1)]);
     // Bilinear, one independent expression per channel (no shared temporaries).
-    let rr = u32(clamp((f32(c00.x) * (1.0 - wx) + f32(c10.x) * wx) * (1.0 - wy)
-                     + (f32(c01.x) * (1.0 - wx) + f32(c11.x) * wx) * wy, 0.0, 255.0));
-    let gg = u32(clamp((f32(c00.y) * (1.0 - wx) + f32(c10.y) * wx) * (1.0 - wy)
-                     + (f32(c01.y) * (1.0 - wx) + f32(c11.y) * wx) * wy, 0.0, 255.0));
-    let bb = u32(clamp((f32(c00.z) * (1.0 - wx) + f32(c10.z) * wx) * (1.0 - wy)
-                     + (f32(c01.z) * (1.0 - wx) + f32(c11.z) * wx) * wy, 0.0, 255.0));
+    let rr = u32(clamp(((f32(c00.x) * (1.0 - wx) + f32(c10.x) * wx) * (1.0 - wy)
+                     + (f32(c01.x) * (1.0 - wx) + f32(c11.x) * wx) * wy) * gain, 0.0, 255.0));
+    let gg = u32(clamp(((f32(c00.y) * (1.0 - wx) + f32(c10.y) * wx) * (1.0 - wy)
+                     + (f32(c01.y) * (1.0 - wx) + f32(c11.y) * wx) * wy) * gain, 0.0, 255.0));
+    let bb = u32(clamp(((f32(c00.z) * (1.0 - wx) + f32(c10.z) * wx) * (1.0 - wy)
+                     + (f32(c01.z) * (1.0 - wx) + f32(c11.z) * wx) * wy) * gain, 0.0, 255.0));
     let aa = u32(clamp((f32(c00.w) * (1.0 - wx) + f32(c10.w) * wx) * (1.0 - wy)
                      + (f32(c01.w) * (1.0 - wx) + f32(c11.w) * wx) * wy, 0.0, 255.0));
     f_out[gid] = rr | (gg << 8u) | (bb << 16u) | (aa << 24u);
@@ -171,15 +179,18 @@ IMGINFO_SIZE = 16   # bytes per ImgInfo { start, w, h, count }
 
 
 class GpuPreprocess:
-    """Batch fused preprocess (bbox + cover-resize 124x240 + shift) on GPU."""
+    """Batch fused preprocess (bbox + cover/fit-width resize + shift) on GPU."""
 
     def __init__(self, max_images: int = MAX_QUERIES_DEFAULT, width: int = CW,
                  height: int = CH, device=None, trim_blue: bool = True,
-                 align: str = "top-center"):
+                 align: str = "top-center", fit_width: bool = False,
+                 unmask: float = 0.0):
         require_gpu("GPU preprocess")
         self.width, self.height = width, height
         self.max_images = max_images
         self.trim_blue = trim_blue
+        self.fit_width = bool(fit_width)
+        self.unmask = float(unmask) if unmask else 0.0
         self.halign, self.valign = _align_codes(align)
         self.device = device or default_device()
         module = compile_module(self.device, WGSL, "GPU preprocess")
@@ -201,10 +212,16 @@ class GpuPreprocess:
             self.device, max_images * IMGINFO_SIZE)
         self.offs_buf = create_buffer(self.device, (max_images + 1) * 4)
         self.n_buf = create_buffer(self.device, 4)
-        self.wh_buf = create_buffer(self.device, 20)   # [W, H, shift_y, halign, valign]
-        upload(self.device, self.wh_buf,
-               np.array([width, height, SHIFT_Y_DEFAULT,
-                         self.halign, self.valign], np.uint32))
+        self.wh_buf = create_buffer(self.device, 28)
+        upload(self.device, self.wh_buf, self._wh_array(SHIFT_Y_DEFAULT))
+
+    def _wh_array(self, shift_y: int) -> np.ndarray:
+        """Kernel config: [W, H, shift_y, halign, valign, fit_width, unmask_bits]."""
+        wh = np.zeros(7, np.uint32)
+        wh[:6] = [self.width, self.height, shift_y,
+                  self.halign, self.valign, int(self.fit_width)]
+        wh[6] = np.frombuffer(np.float32([self.unmask]), np.uint32)[0]
+        return wh
 
     def _enqueue(self, pass_, name: str, buffers: list,
                  total: int | None = None, threadgroups: int | None = None):
@@ -248,9 +265,7 @@ class GpuPreprocess:
         bbox[:, 1] = BBOX_SENTINEL
         upload(self.device, self.bbox_buf, bbox)
         upload(self.device, self.n_buf, np.array([m], np.uint32))
-        upload(self.device, self.wh_buf,
-               np.array([self.width, self.height, shift_y,
-                         self.halign, self.valign], np.uint32))
+        upload(self.device, self.wh_buf, self._wh_array(shift_y))
         self._tgo = tgo
         self._shift_y = shift_y
         return m

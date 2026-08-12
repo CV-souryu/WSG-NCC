@@ -9,7 +9,12 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from cascade_ncc.primitives import features_from_rgba, preprocess_card
+from cascade_ncc._constants import HIST_DIM
+from cascade_ncc.primitives import (
+    features_from_rgba,
+    features_rgb_from_rgba,
+    preprocess_card,
+)
 from tests.conftest import ship_name_of
 
 PREPROCESS_RGB_TOL = 50   # fused preprocess is bilinear, CPU _preprocess LANCZOS
@@ -77,6 +82,22 @@ def test_gpu_preprocess_matches_cpu(gpu_context, cards):
         d = np.abs(out[i].astype(int) - ref.astype(int))
         assert d[:, :, :3].max() <= PREPROCESS_RGB_TOL, f"card {i} rgb"
         assert d[:, :, 3].max() <= 1, f"card {i} alpha"
+
+
+def test_gpu_preprocess_unmask_matches_cpu(gpu_context, cards):
+    """GPU unmask (RGB / unmask) matches the CPU preprocess within bilinear tol."""
+    UNMASK_RGB_TOL = 120
+    imgs = _load_cards(cards, 2)
+    for trim_blue in (True, False):
+        pre = gpu_context["GpuPreprocess"](max_images=4, trim_blue=trim_blue,
+                                           unmask=0.5,
+                                           device=gpu_context["device"])
+        out = pre.run(imgs, shift_y=4)
+        for i, a in enumerate(imgs):
+            ref = preprocess_card(a, trim_blue, 4, unmask=0.5)
+            d = np.abs(out[i].astype(int) - ref.astype(int))
+            assert d[:, :, :3].max() <= UNMASK_RGB_TOL, f"trim={trim_blue} card {i} rgb"
+            assert d[:, :, 3].max() <= 1, f"trim={trim_blue} card {i} alpha"
 
 
 def test_gpu_concurrent_inference_serialized(gpu_context, cards):
@@ -159,59 +180,61 @@ def test_gpu_sampler_sample_all_matches_cpu(gpu_context, cards):
     sd.enqueue_sample_all(p3, pre.out_buf, ss.pts_buf, sd.common_buf,
                           sd.num_points, ss.num_points,
                           dpool=cb.params["step"], spool=cb.params["ncc_pool"],
-                          bins=8, m=2)
+                          m=2)
     p3.end()
     dev.queue.submit([encoder.finish()])
-    n = 2 * ss.num_points
-    sgray = np.frombuffer(download(dev, sd.sa_sgray_buf, n * 4),
-                          np.uint32).copy().astype(np.uint8).reshape(2, ss.num_points)
-    svalid = np.frombuffer(download(dev, sd.sa_svalid_buf, n * 4),
-                           np.uint32).copy().astype(np.uint8).reshape(2, ss.num_points)
-    hist = np.frombuffer(download(dev, sd.hist_buf, 2 * 512 * 4),
-                         np.uint32).copy().reshape(2, 512)
+    n3 = 2 * ss.num_points * 3
+    srgb = np.frombuffer(download(dev, sd.sa_srgb_buf, n3 * 4),
+                         np.uint32).copy().astype(np.uint8).reshape(
+        2, ss.num_points, 3)
+    svalid = np.frombuffer(download(dev, sd.sa_svalid_buf, n3 * 4),
+                           np.uint32).copy().astype(np.uint8).reshape(
+        2, ss.num_points, 3)
+    hist = np.frombuffer(download(dev, sd.hist_buf, 2 * HIST_DIM * 4),
+                         np.uint32).copy().reshape(2, HIST_DIM)
     # CPU reference on the SAME processed image the GPU sampled (pre.out_buf)
     out_arr = np.frombuffer(download(dev, pre.out_buf, 2 * 240 * 124 * 4),
                             np.uint8).copy().reshape(2, 240, 124, 4)
     imgs = [Image.fromarray(out_arr[i]) for i in range(2)]
-    # sparse gray/valid
+    # sparse RGB/valid
     for i, im in enumerate(imgs):
-        sg, sv = features_from_rgba(im, cb.xs8, cb.ys8, cb.params["ncc_pool"])
-        # GPU pools float luma, CPU pools PIL's uint8 luma -> a few units apart
-        assert np.abs(sgray[i].astype(int) - sg.astype(int)).max() <= 5, \
-            f"card {i} sparse gray"
-        assert np.array_equal(svalid[i].astype(bool), sv), f"card {i} sparse valid"
-    # dense histogram
+        sg, sv = features_rgb_from_rgba(im, cb.xs8, cb.ys8,
+                                        cb.params["ncc_pool"])
+        assert np.abs(srgb[i].astype(int) - sg.astype(int)).max() <= 5, \
+            f"card {i} sparse rgb"
+        assert np.array_equal(svalid[i][:, 0].astype(bool), sv), \
+            f"card {i} sparse valid"
+    # dense HSL spatial histogram
+    from cascade_ncc.codebook import codebook_hist
     for i, im in enumerate(imgs):
         _, v = features_from_rgba(im, cb.xs, cb.ys, cb.params["step"])
         rgb = _pooled_rgb(im, cb.xs, cb.ys, cb.params["step"])
-        idx = np.nonzero(cb.common & v)[0]
-        qb = (rgb[idx].astype(np.int64) >> 5)
-        cpu = np.bincount(qb[:, 0] * 64 + qb[:, 1] * 8 + qb[:, 2],
-                          minlength=512)
-        assert np.array_equal(hist[i].astype(int), cpu), f"card {i} hist"
+        cpu = codebook_hist(cb, rgb, v, normalize=False)
+        # HSL bins sit on float boundaries: pooled RGB can differ by 1 unit
+        # between CPU/GPU, occasionally flipping a bin -> allow +-2 counts.
+        assert np.abs(hist[i].astype(int) - cpu).max() <= 2, f"card {i} hist"
 
 
 def test_gpu_scorer_matches_cpu(gpu_context, cards):
     """Fused prune+top-N+NCC scorer matches the CPU cascade scoring."""
     from cascade_ncc.codebook import load_cascade_codebook
+    from cascade_ncc.codebook import codebook_hist
     from cascade_ncc.codebook_match import match_codebook
     cb = load_cascade_codebook("cascade")
     imgs = [Image.fromarray(preprocess_card(a, True, 4))
             for a in _load_cards(cards, 3)]
     # raw hist + sparse features via CPU
-    feats_raw = np.zeros((3, 512), np.uint32)
-    sgray = np.zeros((3, len(cb.xs8)), np.uint8)
-    svalid = np.zeros((3, len(cb.xs8)), np.uint8)
+    feats_raw = np.zeros((3, HIST_DIM), np.uint32)
+    srgb = np.zeros((3, len(cb.xs8) * 3), np.uint8)
+    svalid = np.zeros((3, len(cb.xs8) * 3), np.uint8)
     for i, im in enumerate(imgs):
         _, v = features_from_rgba(im, cb.xs, cb.ys, cb.params["step"])
         rgb = _pooled_rgb(im, cb.xs, cb.ys, cb.params["step"])
-        idx = np.nonzero(cb.common & v)[0]
-        qb = (rgb[idx].astype(np.int64) >> 5)
-        feats_raw[i] = np.bincount(qb[:, 0] * 64 + qb[:, 1] * 8 + qb[:, 2],
-                                   minlength=512)
-        sg, sv = features_from_rgba(im, cb.xs8, cb.ys8, cb.params["ncc_pool"])
-        sgray[i] = sg
-        svalid[i] = sv.astype(np.uint8)
+        feats_raw[i] = codebook_hist(cb, rgb, v, normalize=False)
+        sg, sv = features_rgb_from_rgba(im, cb.xs8, cb.ys8,
+                                        cb.params["ncc_pool"])
+        srgb[i] = sg.reshape(-1)
+        svalid[i] = np.repeat(sv.astype(np.uint8), 3)
     # CPU reference
     feats_n = feats_raw.astype(np.float32)
     feats_n /= np.maximum(np.linalg.norm(feats_n, axis=1, keepdims=True), 1e-6)
@@ -220,12 +243,12 @@ def test_gpu_scorer_matches_cpu(gpu_context, cards):
         cand = np.argpartition(cb.hist @ feats_n[i], -20)[-20:]
         sc = match_codebook(cb.normed8[cand], cb.samples8[cand],
                             cb.valid8[cand], cb.common8,
-                            sgray[i].astype(np.float32),
+                            srgb[i].astype(np.float32),
                             svalid[i].astype(bool), refine=50)
         o = np.argsort(sc)[::-1][:3]
         cpu_idx.append(cand[o]); cpu_sc.append(sc[o])
     scorer = gpu_context["CascadeGpuScorer"](cb, max_queries=4)
-    gpu_idx, gpu_sc = scorer.score(feats_raw, sgray, svalid, k=3, top_n=20)
+    gpu_idx, gpu_sc = scorer.score(feats_raw, srgb, svalid, k=3, top_n=20)
     assert np.array_equal(gpu_idx, np.stack(cpu_idx))
     assert np.abs(gpu_sc - np.stack(cpu_sc)).max() < 1e-4
 
@@ -308,7 +331,7 @@ def test_cascade_gpu_custom_canvas(gpu_context, tmp_path):
     from cascade_ncc.codebook import build_cascade_codebook
     from cascade_ncc.recognizer import CascadeShipRecognizer, recognize_cascade
     from tests.conftest import _write_gallery
-    paths = _write_gallery(tmp_path, 4)
+    paths = _write_gallery(tmp_path, 4, size=(62, 120))
     cb = build_cascade_codebook(paths, cache_path=tmp_path / "cb62.npz",
                                 cw=62, ch=120, step=2, ncc_step=4, ncc_pool=3)
     rec = CascadeShipRecognizer(str(tmp_path / "cb62.npz"), use_gpu=True,
@@ -322,3 +345,26 @@ def test_cascade_gpu_custom_canvas(gpu_context, tmp_path):
         assert cpu[0][0] == i, f"card {i} not self-match on CPU"
         assert gpu_out[i][0][1].resolve() == p.resolve(), \
             f"card {i} GPU top-1 mismatch"
+
+
+def test_region_activation_gpu_matches_cpu(gpu_context, tmp_path):
+    """Region-restricted GPU recognition matches the CPU region path."""
+    from cascade_ncc.codebook import build_cascade_codebook
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import _write_gallery
+    paths = _write_gallery(tmp_path, 4)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0,
+                           step=2, ncc_step=4, ncc_pool=3)
+    region = (0, 50, 0, 100)
+    gpu = CascadeShipRecognizer(str(cb_path), use_gpu=True,
+                                trim_blue=False, shift_y=0, region=region)
+    cpu = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                trim_blue=False, shift_y=0, region=region)
+    arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+    assert gpu._gpu is not None
+    for i, arr in enumerate(arrs):
+        got = gpu.recognize(arr, k=1)[0][0]
+        ref = cpu.recognize(arr, k=1)[0][0]
+        assert got == ref == i, f"card {i}: gpu={got} cpu={ref}"

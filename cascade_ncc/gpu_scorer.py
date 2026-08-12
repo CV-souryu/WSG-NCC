@@ -1,8 +1,8 @@
 """Cascade scoring in TWO WGSL dispatches: batch prune -> select (top-N + NCC).
 
-The gallery (hist 3362x512, sparse samples/valid 3362x384, common mask) is
+The gallery (hist 3362x576, sparse samples/valid 3362x384, common mask) is
 uploaded once and persists on the GPU (~17 MB). Each query batch uploads only
-the 512-d histograms + sparse query gray/valid, then:
+the 576-d histograms + sparse query gray/valid, then:
 
   1. ``prune_scores`` — batch-parallel: a 2D grid of one thread per gallery row
      computes score[j] = hist_gallery[j] . feats. High occupancy hides the
@@ -341,7 +341,7 @@ class CascadeGpuScorer:
         enqueue(pass_, self.device, self.select_pipe, self.select_bgl,
                 [self.scores_buf, self.samples_buf,
                  self.valid_buf, self.common_buf,
-                 sd.sa_sgray_buf, sd.sa_svalid_buf,
+                 sd.sa_srgb_buf, sd.sa_svalid_buf,
                  (self.out_buf, 0, self._seg),
                  (self.out_buf, self._seg, self._seg), self.p_buf], m)
 
