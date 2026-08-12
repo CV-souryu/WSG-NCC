@@ -23,6 +23,13 @@ from cascade_ncc import ROOT as PKG_ROOT
 _DATA = PKG_ROOT / "data"
 _TEST = _DATA / "groups" / "group1" / "testset"
 TEST_CARDS = sorted((_TEST / "cards").glob("*.png")) if (_TEST / "cards").is_dir() else []
+CARD_12_DIR = _TEST / "card-12-r2c6"
+CARD_12_CARDS = sorted(
+    (p for p in CARD_12_DIR.glob("card-*.png") if "-overlay" not in p.name),
+    key=lambda p: int(p.name.split("-")[1]),
+) if CARD_12_DIR.is_dir() else []
+CARD_PARAMS = json.loads((_TEST / "card_params.json").read_text(encoding="utf-8")) \
+    if (_TEST / "card_params.json").exists() else {}
 MANIFEST = (_TEST / "manifest.jsonl").read_text(encoding="utf-8") \
     if (_TEST / "manifest.jsonl").exists() else ""
 SHIP_NAMES = json.loads((_DATA / "ship_names.json").read_text(encoding="utf-8")) \

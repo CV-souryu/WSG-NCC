@@ -7,6 +7,7 @@ off-by-one, src_start bytes-vs-pixels, Metal uchar3 misreads, atomic types).
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from cascade_ncc._constants import BLUE_TRIM_THRESH, HIST_DIM
@@ -105,7 +106,8 @@ def test_gpu_concurrent_inference_serialized(gpu_context, cards):
     import threading
 
     from cascade_ncc.recognizer import CascadeShipRecognizer
-    recs = [CascadeShipRecognizer("cascade"), CascadeShipRecognizer("cascade")]
+    recs = [CascadeShipRecognizer("cascade", min_confidence=None),
+            CascadeShipRecognizer("cascade", min_confidence=None)]
     sub = cards[:6]
     arrs = [np.asarray(Image.open(c).convert("RGBA")) for c in sub]
     ref = [[str(x[1]) for x in top] for top in recs[0].recognize(arrs, k=3)]
@@ -258,7 +260,7 @@ def test_cascade_gpu_matches_cpu(gpu_context, cards):
     from cascade_ncc.codebook import load_cascade_codebook
     from cascade_ncc.recognizer import CascadeShipRecognizer, recognize_cascade
     cb = load_cascade_codebook("cascade")
-    rec = CascadeShipRecognizer("cascade")
+    rec = CascadeShipRecognizer("cascade", min_confidence=None)
     cards = cards[:6]
     arrs = [np.asarray(Image.open(c).convert("RGBA")) for c in cards]
     gpu_out = rec.recognize(arrs, k=3)
@@ -298,7 +300,7 @@ def test_gpu_trim_blue_override_applied(gpu_context, cards):
 def test_gpu_batch_matches_single(gpu_context, cards):
     """Batch recognition == processing each card individually on the GPU."""
     from cascade_ncc.recognizer import CascadeShipRecognizer
-    rec = CascadeShipRecognizer("cascade")
+    rec = CascadeShipRecognizer("cascade", min_confidence=None)
     cards = cards[:4]
     arrs = [np.asarray(Image.open(c).convert("RGBA")) for c in cards]
     batch = rec.recognize(arrs, k=3)
@@ -492,3 +494,37 @@ def test_gpu_nondefault_histogram_falls_back_to_cpu(gpu_context, tmp_path):
     bad = replace(cb, params={**cb.params, "hue_bins": 8})
     rec = CascadeShipRecognizer(bad, use_gpu=True, trim_blue=False, shift_y=0)
     assert rec._gpu is None
+
+
+def test_card_00_13_per_card_params(gpu_context):
+    """card-00..card-13 use their own normal/masked inference params."""
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import CARD_12_CARDS, CARD_PARAMS
+
+    if not CARD_12_CARDS:
+        pytest.skip("card-12-r2c6 testset not present")
+    card_params = CARD_PARAMS.get("cards", {})
+    fallback = CARD_PARAMS.get("fallback", {
+        "mode": "normal", "region": (0, 60, 0, 100), "unmask": 0.0})
+    cpu_normal = CascadeShipRecognizer("cascade", use_gpu=False,
+                                       region=(0, 60, 0, 100),
+                                       min_confidence=None)
+    cpu_masked = CascadeShipRecognizer("cascade", use_gpu=False,
+                                       region=(0, 40, 0, 100), unmask=0.33,
+                                       min_confidence=None)
+    gpu_normal = CascadeShipRecognizer("cascade", use_gpu=True,
+                                       region=(0, 60, 0, 100),
+                                       min_confidence=None)
+    gpu_masked = CascadeShipRecognizer("cascade", use_gpu=True,
+                                       region=(0, 40, 0, 100), unmask=0.33,
+                                       min_confidence=None)
+    for p in CARD_12_CARDS:
+        cp = card_params.get(p.name, fallback)
+        cpu_rec = cpu_masked if cp.get("mode") == "masked" else cpu_normal
+        gpu_rec = gpu_masked if cp.get("mode") == "masked" else gpu_normal
+        arr = np.asarray(Image.open(p).convert("RGBA"))
+        c = cpu_rec.recognize(arr, k=1)[0]
+        g = gpu_rec.recognize(arr, k=1)[0]
+        assert c[2] >= 0.9, f"{p.name} CPU score too low: {c[2]:.4f}"
+        assert ship_name_of(c[1]) == ship_name_of(g[1]), \
+            f"{p.name}: CPU={ship_name_of(c[1])} GPU={ship_name_of(g[1])}"

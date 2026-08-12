@@ -41,7 +41,7 @@ data/groups/group1/testset/cards/001.png
 
 参数：`--codebook`（名字解析到 `data/codebooks/<name>.npz`，或直接给 `.npz` 路径）、
 `--k`（每图 top-k）、`--backend`（`cpu` / `gpu`，gpu 不可用时自动回退）、
-`--min-confidence`（低于该 top-1 分的不输出，默认 0.4；设 0 关闭过滤）、
+`--min-confidence`（低于该 top-1 分的不输出，默认 0.7；设 0 关闭过滤）、
 `--fit-width / --no-fit-width`（宽缩放 / cover，不传用码本 params）、
 `--unmask`（除以该因子还原被遮罩压暗的 RGB，0 显式关闭，不传用码本 params）、
 `--region TOP BOTTOM LEFT RIGHT`（只激活中心落在该百分比区域内的 3×3 直方图
@@ -184,7 +184,7 @@ CascadeShipRecognizer(
     fit_width=None,            # None = 从码本 params 读取
     unmask=None,               # None = 从码本 params 读取；0.0 显式关闭
     region=None,               # (top, bottom, left, right) % 区域激活直方图分区
-    min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
+    min_confidence=0.7,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
 
@@ -194,7 +194,7 @@ CascadeShipRecognizer(
 - 单图输入：`[(gallery_index: int, gallery_path: Path, score: float), ...]`
 - 批量输入（`list` / `tuple`）：上面这个列表的列表，每张图一个。
 
-`recognize(images, k=3, min_confidence=0.4)`：低于阈值的匹配被丢弃，top-1 低于
+`recognize(images, k=3, min_confidence=0.7)`：低于阈值的匹配被丢弃，top-1 低于
 阈值时该图返回空列表 `[]`。`min_confidence` 不传时用构造函数的值，构造函数传
 `None` 关闭过滤（也可用 `min_confidence=0.0`）。
 
@@ -232,7 +232,7 @@ rec = CascadeRecognizer(
     fit_width=None,            # None = 从码本 params 读取
     unmask=None,               # None = 从码本 params 读取；0.0 显式关闭
     region=None,               # (top, bottom, left, right) % 区域激活直方图分区
-    min_confidence=0.4,        # top-1 低于该分返回空列表；None 关闭过滤
+    min_confidence=0.7,        # top-1 低于该分返回空列表；None 关闭过滤
 )
 ```
 
@@ -244,7 +244,7 @@ top = rec.recognize(img_rgba_u8, k=3)   # [(值或None, 置信度, key), ...]
 tops = rec.recognize([img1, img2], k=3) # 批量 -> 每图一个 [(值, 置信度, key), ...]
 ```
 
-`rec.recognize(images, k=3, min_confidence=0.4)` 同样支持阈值过滤：低于 0.4 的
+`rec.recognize(images, k=3, min_confidence=0.7)` 同样支持阈值过滤：低于 0.7 的
 匹配被丢弃，top-1 低于阈值时返回空列表。不传时用构造函数的值，构造函数传
 `None` 关闭过滤。
 

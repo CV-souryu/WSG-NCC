@@ -50,4 +50,4 @@ SHIFT_Y_DEFAULT = 4
 K_DEFAULT = 3
 TOP_N_DEFAULT = 20
 MAX_QUERIES_DEFAULT = 128
-MIN_CONFIDENCE_DEFAULT = 0.4   # below this top-1 score, recognize returns []
+MIN_CONFIDENCE_DEFAULT = 0.7   # below this top-1 score, recognize returns []
