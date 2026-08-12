@@ -124,6 +124,10 @@ CascadeShipRecognizer(
 阈值时该图返回空列表 `[]`。`min_confidence` 不传时用构造函数的值，构造函数传
 `None` 关闭过滤（也可用 `min_confidence=0.0`）。
 
+`recognize(images, k=3, fit_width=False, unmask=0.4, region=(0,40,0,100))`
+支持**本次调用临时覆盖**预处理/激活配置（不改变实例本身）；内部按配置缓存
+临时识别器，重复使用同一覆盖配置不会重复重建。
+
 ```python
 r = CascadeShipRecognizer("cascade", use_gpu=True)
 top = r.recognize(img_rgba_u8, k=3)          # 单图 -> 一个结果列表

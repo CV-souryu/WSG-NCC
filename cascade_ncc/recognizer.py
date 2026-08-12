@@ -14,6 +14,7 @@ GpuSampler(gray, ncc_pool) for the exact NCC. Histogram/prune/NCC stay on CPU.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Generic, TypeVar
 
@@ -141,11 +142,14 @@ class CascadeShipRecognizer:
                  min_confidence: float | None = MIN_CONFIDENCE_DEFAULT):
         # A codebook may be a name/path, raw .npz bytes, or an already-loaded
         # CascadeCodebook object.
-        self.cb = (codebook if isinstance(codebook, CascadeCodebook)
-                   else load_cascade_codebook(codebook))
+        self._base_cb = (codebook if isinstance(codebook, CascadeCodebook)
+                         else load_cascade_codebook(codebook))
         self.region = None if region is None else tuple(region)
         if self.region is not None:
-            self.cb = region_codebook(self.cb, self.region)
+            self.cb = region_codebook(self._base_cb, self.region)
+        else:
+            self.cb = self._base_cb
+        self._override_cache: OrderedDict = OrderedDict()
         p = self.cb.params
         # Default the query preprocessing from the codebook's recorded params so
         # recognition auto-matches how the gallery was laid out. Explicit args
@@ -203,8 +207,31 @@ class CascadeShipRecognizer:
                                        device=device),
         }
 
+    def _override_recognizer(self, fit_width, unmask, region):
+        """A cached recognizer with temporary preprocessing/inference config."""
+        key = (bool(fit_width), float(unmask or 0.0),
+               None if region is None else tuple(region))
+        rec = self._override_cache.get(key)
+        if rec is None:
+            rec = CascadeShipRecognizer(
+                self._base_cb, use_gpu=self.use_gpu,
+                max_queries=self.max_queries,
+                trim_blue=self.trim_blue, shift_y=self.shift_y,
+                align=self.align, top_n=self.top_n,
+                fit_width=fit_width, unmask=unmask, region=region,
+                min_confidence=self.min_confidence)
+            self._override_cache[key] = rec
+            self._override_cache.move_to_end(key)
+            while len(self._override_cache) > 4:
+                self._override_cache.popitem(last=False)
+        return rec
+
     def recognize(self, images, k: int = K_DEFAULT,
-                  min_confidence: float | None = None):
+                  min_confidence: float | None = None,
+                  *,
+                  fit_width: bool | None = None,
+                  unmask: float | None = None,
+                  region: tuple[float, float, float, float] | None = None):
         """Recognize one or many images; returns top-k per image.
 
         Each input is a (H, W, 3/4) uint8 numpy array or a file path. A single
@@ -214,7 +241,16 @@ class CascadeShipRecognizer:
         (per image, in rank order); an image whose top-1 is below it returns
         an empty list. ``None`` falls back to the constructor's value
         (``self.min_confidence``); constructor ``None`` disables filtering.
+
+        ``fit_width`` / ``unmask`` / ``region`` optionally override the
+        recognizer's config for THIS call only (cached per config).
         """
+        if fit_width is not None or unmask is not None or region is not None:
+            rec = self._override_recognizer(
+                self.fit_width if fit_width is None else fit_width,
+                self.unmask if unmask is None else unmask,
+                self.region if region is None else tuple(region))
+            return rec.recognize(images, k=k, min_confidence=min_confidence)
         if min_confidence is None:
             min_confidence = self.min_confidence
         single = not isinstance(images, (list, tuple))
@@ -399,7 +435,11 @@ class CascadeRecognizer(Generic[T]):
         return self._keys
 
     def recognize(self, images, k: int | None = None,
-                  min_confidence: float | None = None):
+                  min_confidence: float | None = None,
+                  *,
+                  fit_width: bool | None = None,
+                  unmask: float | None = None,
+                  region: tuple[float, float, float, float] | None = None):
         """Recognize one or many images; returns (value, confidence, key).
 
         A single input returns one list of top-k ``(value, confidence, key)``;
@@ -416,7 +456,10 @@ class CascadeRecognizer(Generic[T]):
             min_confidence = self._rec.min_confidence
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
-        results = self._rec.recognize(image_list, k=k, min_confidence=min_confidence)
+        results = self._rec.recognize(image_list, k=k,
+                                      min_confidence=min_confidence,
+                                      fit_width=fit_width, unmask=unmask,
+                                      region=region)
         out = [[(self._meta.get(self._keys[idx]), float(score), self._keys[idx])
                 for idx, _, score in top] for top in results]
         return out[0] if single else out

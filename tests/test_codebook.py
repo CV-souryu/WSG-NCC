@@ -153,6 +153,22 @@ def test_region_activation_top50_buckets(tmp_path):
     assert top[0][0] == 0
 
 
+def test_recognize_per_call_override(tmp_path):
+    """recognize(..., region=, unmask=, fit_width=) overrides this call only."""
+    paths = _write_gallery(tmp_path, 2)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0, **_BUILD)
+    rec = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                trim_blue=False, shift_y=0)
+    kwargs = dict(region=(0, 50, 0, 100), unmask=0.0, fit_width=False)
+    got = rec.recognize(paths[0], k=1, **kwargs)
+    ref = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                trim_blue=False, shift_y=0, **kwargs)
+    assert got == ref.recognize(paths[0], k=1)
+    assert rec._override_cache
+
+
 def test_recognize_cascade_array_input(tmp_path):
     paths = _write_gallery(tmp_path, 4)
     cb = _build(tmp_path, paths)
