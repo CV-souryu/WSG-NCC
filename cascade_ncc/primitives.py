@@ -113,13 +113,15 @@ def _pooled_multi(channels: list[np.ndarray], xs: np.ndarray,
 
 
 def _bilinear_at(img: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
-    h, w = img.shape
+    h, w = img.shape[-2:]
     x = np.clip(xs, 0, w - 1); y = np.clip(ys, 0, h - 1)
     x0 = np.floor(x).astype(int); y0 = np.floor(y).astype(int)
     x1 = np.minimum(x0 + 1, w - 1); y1 = np.minimum(y0 + 1, h - 1)
     wx = (x - x0).astype(np.float32); wy = (y - y0).astype(np.float32)
-    c00 = img[y0, x0]; c10 = img[y0, x1]
-    c01 = img[y1, x0]; c11 = img[y1, x1]
+    # ``...`` lets the same helper serve 2D (H, W) and batched (N, H, W)
+    # inputs; the code-point index arrays broadcast against the batch dim.
+    c00 = img[..., y0, x0]; c10 = img[..., y0, x1]
+    c01 = img[..., y1, x0]; c11 = img[..., y1, x1]
     return (c00 * (1 - wx) + c10 * wx) * (1 - wy) + \
            (c01 * (1 - wx) + c11 * wx) * wy
 

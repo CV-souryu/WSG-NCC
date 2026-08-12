@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,6 +56,8 @@ from .primitives import (
     features_rgb_from_rgba,
     numpy_resize,
 )
+
+_LOG = logging.getLogger(__name__)
 
 CODEBOOK_DIR = (Path(__file__).resolve().parent.parent
                 / "data" / "codebooks")
@@ -192,7 +195,7 @@ def region_cell_mask(cb: CascadeCodebook,
         raise ValueError("region must satisfy 0<=top<bottom<=100 and "
                          "0<=left<right<=100")
     p = cb.params
-    cells_x, cells_y = p["cells"]
+    cells_x, cells_y = p.get("cells", (HIST_CELLS_X, HIST_CELLS_Y))
     cw, ch = _canvas(cb)
     cy = (np.arange(cells_y) + 0.5) * ch / cells_y
     cx = (np.arange(cells_x) + 0.5) * cw / cells_x
@@ -229,7 +232,9 @@ def region_codebook(cb: CascadeCodebook,
     if region is None:
         return cb
     p = cb.params
-    color_bins = p["hue_bins"] * p["sat_bins"] * p["lig_bins"]
+    color_bins = (p.get("hue_bins", HUE_BINS)
+                  * p.get("sat_bins", SAT_BINS)
+                  * p.get("lig_bins", LIG_BINS))
     cell_mask = region_cell_mask(cb, region)
     hist_mask = np.repeat(cell_mask, color_bins)
     cw, ch = _canvas(cb)
@@ -360,6 +365,35 @@ def build_cascade_codebook(
     gallery's canonical layout — the recognizer reads them back so recognition
     auto-uses the same config instead of silently mismatching.
     """
+    cells = tuple(cells)
+    if step < 1:
+        raise ValueError(f"step must be >= 1, got {step}")
+    if ncc_step < step:
+        raise ValueError(
+            f"ncc_step must be >= step ({step}), got {ncc_step}")
+    if ncc_step % step != 0:
+        raise ValueError(
+            f"ncc_step must be a multiple of step ({step}), got {ncc_step}")
+    if ncc_pool < 1:
+        raise ValueError(f"ncc_pool must be >= 1, got {ncc_pool}")
+    if not (0 < top_fraction <= 1):
+        raise ValueError(
+            f"top_fraction must be in (0, 1], got {top_fraction}")
+    if cw < step or ch < step:
+        raise ValueError(
+            f"canvas {cw}x{ch} must be at least step={step} in each dimension")
+    if len(cells) != 2 or min(cells) < 1:
+        raise ValueError(f"cells must be two positive ints, got {cells}")
+    if not (0 <= min_common_frac <= 1):
+        raise ValueError(
+            f"min_common_frac must be in [0, 1], got {min_common_frac}")
+    if (hue_bins, sat_bins, lig_bins) != (HUE_BINS, SAT_BINS, LIG_BINS):
+        raise ValueError(
+            "histogram bins are fixed by the GPU kernels: hue_bins=16, "
+            "sat_bins=2, lig_bins=2")
+    if cells != (HIST_CELLS_X, HIST_CELLS_Y):
+        raise ValueError(
+            "histogram cells are fixed by the GPU kernels: (3, 3)")
     paths = [Path(p).resolve() for p in paths]
     if cache_path is not None:
         cache_path = Path(cache_path)
@@ -411,16 +445,18 @@ def build_cascade_codebook(
     valid8 = np.stack(v8r)
     common8 = valid8.mean(axis=0) >= min_common_frac
     normed8 = _normalize(samples8, common8)
-    print(f"cascade codebook built: {len(paths)} imgs, hist {hist.shape[1]}d, "
-          f"NCC {len(xs8)} pts/{int(common8.sum())} common channels "
-          f"({time.perf_counter() - t0:.1f}s)")
+    _LOG.info("cascade codebook built: %d imgs, hist %dd, NCC %d pts/%d "
+              "common channels (%.1fs)",
+              len(paths), hist.shape[1], len(xs8), int(common8.sum()),
+              time.perf_counter() - t0)
 
     cb = CascadeCodebook(paths, xs, ys, common, hist, xs8, ys8,
                          samples8, valid8, common8, normed8, params)
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache, **_to_npz(cb, json.dumps(params), key))
-        print(f"wrote {cache} ({cache.stat().st_size / 1e6:.2f} MB)")
+        _LOG.info("wrote %s (%.2f MB)", cache,
+                  cache.stat().st_size / 1e6)
     return cb
 
 

@@ -395,3 +395,100 @@ def test_region_activation_gpu_matches_cpu(gpu_context, tmp_path):
         got = gpu.recognize(arr, k=1)[0][0]
         ref = cpu.recognize(arr, k=1)[0][0]
         assert got == ref == i, f"card {i}: gpu={got} cpu={ref}"
+
+
+def test_gpu_align_override_applied(gpu_context, tmp_path):
+    """Recognizer align override must reach the shared GPU preprocess."""
+    from cascade_ncc._gpu import download
+    from cascade_ncc.codebook import build_cascade_codebook
+    from cascade_ncc.primitives import preprocess_card
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import _write_gallery
+
+    paths = _write_gallery(tmp_path, 4)
+    cbp = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cbp, step=2, ncc_step=4,
+                           ncc_pool=3, trim_blue=False, shift_y=0)
+    rng = np.random.RandomState(0)
+    query = np.dstack([
+        rng.randint(0, 256, (180, 100, 3), np.uint8),
+        np.full((180, 100), 255, np.uint8)])
+    rec = CascadeShipRecognizer(str(cbp), use_gpu=True, trim_blue=False,
+                                shift_y=0, align="bottom-right")
+    rec._gpu_batch([query], k=1)
+    pre = rec._gpu["pre"]
+    assert (pre.halign, pre.valign) == (2, 2)
+    out = np.frombuffer(
+        download(pre.device, pre.out_buf, 240 * 124 * 4),
+        np.uint8).copy().reshape(240, 124, 4)
+    ref_br = preprocess_card(query, False, 0, align="bottom-right")
+    ref_top = preprocess_card(query, False, 0, align="top-center")
+    d_br = np.abs(out.astype(int) - ref_br.astype(int))[:, :, :3].max()
+    d_top = np.abs(out.astype(int) - ref_top.astype(int))[:, :, :3].max()
+    assert d_br <= 120
+    assert d_top > 120
+
+
+def test_gpu_k_and_topn_edges_match_cpu(gpu_context, tmp_path):
+    """k > top_n and top_n > gallery must not produce garbage slots."""
+    from cascade_ncc.codebook import build_cascade_codebook
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import _write_gallery
+
+    paths = _write_gallery(tmp_path, 4)
+    cbp = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cbp, step=2, ncc_step=4,
+                           ncc_pool=3, trim_blue=False, shift_y=0)
+    arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+    for top_n in (4, 100):
+        cpu = CascadeShipRecognizer(str(cbp), use_gpu=False, trim_blue=False,
+                                    shift_y=0, top_n=top_n,
+                                    min_confidence=None)
+        gpu = CascadeShipRecognizer(str(cbp), use_gpu=True, trim_blue=False,
+                                    shift_y=0, top_n=top_n,
+                                    min_confidence=None)
+        for arr in arrs:
+            c = [x[0] for x in cpu.recognize(arr, k=6)]
+            g = [x[0] for x in gpu.recognize(arr, k=6)]
+            assert c == g
+            assert len(g) == 4
+
+
+def test_gpu_topn_gt_256_matches_cpu(gpu_context, tmp_path):
+    """Serial refine fallback must score every candidate above 256."""
+    from cascade_ncc.codebook import build_cascade_codebook
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import _write_gallery
+
+    paths = _write_gallery(tmp_path, 300, size=(62, 120))
+    cbp = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cbp, cw=62, ch=120,
+                           step=2, ncc_step=4, ncc_pool=3,
+                           trim_blue=False, shift_y=0)
+    arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths[:3]]
+    cpu = CascadeShipRecognizer(str(cbp), use_gpu=False, trim_blue=False,
+                                shift_y=0, top_n=300, min_confidence=None)
+    gpu = CascadeShipRecognizer(str(cbp), use_gpu=True, trim_blue=False,
+                                shift_y=0, top_n=300, min_confidence=None)
+    for i, arr in enumerate(arrs):
+        c = [x[0] for x in cpu.recognize(arr, k=5)]
+        g = [x[0] for x in gpu.recognize(arr, k=5)]
+        assert c[0] == g[0], f"card {i}: cpu={c} gpu={g}"
+        assert set(c) == set(g), f"card {i}: cpu={c} gpu={g}"
+
+
+def test_gpu_nondefault_histogram_falls_back_to_cpu(gpu_context, tmp_path):
+    """GPU must refuse (not silently mis-score) non-default histogram params."""
+    from dataclasses import replace
+
+    from cascade_ncc.codebook import build_cascade_codebook
+    from cascade_ncc.recognizer import CascadeShipRecognizer
+    from tests.conftest import _write_gallery
+
+    paths = _write_gallery(tmp_path, 4)
+    cbp = tmp_path / "cb.npz"
+    cb = build_cascade_codebook(paths, cache_path=cbp, step=2, ncc_step=4,
+                                ncc_pool=3, trim_blue=False, shift_y=0)
+    bad = replace(cb, params={**cb.params, "hue_bins": 8})
+    rec = CascadeShipRecognizer(bad, use_gpu=True, trim_blue=False, shift_y=0)
+    assert rec._gpu is None

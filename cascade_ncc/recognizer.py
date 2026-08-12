@@ -13,6 +13,7 @@ GpuSampler(gray, ncc_pool) for the exact NCC. Histogram/prune/NCC stay on CPU.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -23,11 +24,15 @@ from PIL import Image
 
 from ._constants import (
     ALPHA_THRESH,
+    HIST_CELLS_X,
+    HIST_CELLS_Y,
+    HUE_BINS,
     K_DEFAULT,
+    LIG_BINS,
     MAX_QUERIES_DEFAULT,
     MIN_CONFIDENCE_DEFAULT,
     OPAQUE_ALPHA,
-    REFINE_NCC,
+    SAT_BINS,
     SHIFT_Y_DEFAULT,
     TOP_N_DEFAULT,
 )
@@ -40,14 +45,15 @@ from .codebook import (
     region_codebook,
 )
 from .codebook_match import match_codebook
-from .primitives import _pooled_multi, preprocess_card
+from .primitives import _align_codes, _pooled_multi, preprocess_card
 
-# Shared codebook-agnostic GPU preprocess. GpuPreprocess holds only the query
-# working set (src/out/bbox buffers), identical across codebooks that share a
-# canvas — so one instance per (max_queries, canvas) serves every codebook.
-# On-demand serial inference keeps this safe.
-_PREPROCESS_CACHE: dict = {}
-_GPU_CORE_CACHE: dict = {}
+_LOG = logging.getLogger(__name__)
+
+# Shared GPU cores: one set of device/working buffers per (codebook object,
+# max_queries, canvas). The cache is bounded so long-running processes that
+# load many codebooks don't accumulate GPU buffers forever.
+_GPU_CORE_CACHE: OrderedDict = OrderedDict()
+_GPU_CORE_MAX = 8
 
 
 def _gpu_core(base_cb: CascadeCodebook, max_queries: int) -> dict:
@@ -57,48 +63,47 @@ def _gpu_core(base_cb: CascadeCodebook, max_queries: int) -> dict:
     from .gpu_sampler import GpuSampler
     from .gpu_scorer import CascadeGpuScorer
     cw, ch = _canvas(base_cb)
+    p = base_cb.params
+    hist_cfg = (
+        p.get("hue_bins", HUE_BINS),
+        p.get("sat_bins", SAT_BINS),
+        p.get("lig_bins", LIG_BINS),
+        tuple(p.get("cells", (HIST_CELLS_X, HIST_CELLS_Y))),
+    )
+    if hist_cfg != (HUE_BINS, SAT_BINS, LIG_BINS,
+                    (HIST_CELLS_X, HIST_CELLS_Y)):
+        raise GpuError(
+            "GPU kernels hardcode the H16S2L2 3x3 histogram; rebuild the "
+            "codebook with default bins/cells or use the CPU backend")
     key = (id(base_cb), max_queries, cw, ch)
-    core = _GPU_CORE_CACHE.get(key)
-    if core is None:
-        with GPU_LOCK:
-            core = _GPU_CORE_CACHE.get(key)
-            if core is None:
-                p = base_cb.params
-                device = default_device()
-                pre = GpuPreprocess(
-                    max_images=max_queries, width=cw, height=ch,
-                    trim_blue=p.get("trim_blue", True),
-                    align=p.get("align", "top-center"),
-                    fit_width=p.get("fit_width", False),
-                    unmask=p.get("unmask") or 0.0, device=device)
-                sd = GpuSampler(base_cb.xs, base_cb.ys,
-                                max_images=max_queries, width=cw, height=ch,
-                                device=device)
-                sd.set_common(base_cb.common)
-                ss = GpuSampler(base_cb.xs8, base_cb.ys8,
-                                max_images=max_queries, width=cw, height=ch,
-                                device=device)
-                scorer = CascadeGpuScorer(base_cb, max_queries=max_queries,
-                                          device=device)
-                core = {"pre": pre, "sd": sd, "ss": ss,
-                        "scorer": scorer, "_cfg": None}
-                _GPU_CORE_CACHE[key] = core
+    with GPU_LOCK:
+        core = _GPU_CORE_CACHE.get(key)
+        if core is not None:
+            _GPU_CORE_CACHE.move_to_end(key)
+            return core
+        device = default_device()
+        pre = GpuPreprocess(
+            max_images=max_queries, width=cw, height=ch,
+            trim_blue=p.get("trim_blue", True),
+            align=p.get("align", "top-center"),
+            fit_width=p.get("fit_width", False),
+            unmask=p.get("unmask") or 0.0, device=device)
+        sd = GpuSampler(base_cb.xs, base_cb.ys,
+                        max_images=max_queries, width=cw, height=ch,
+                        device=device)
+        sd.set_common(base_cb.common)
+        ss = GpuSampler(base_cb.xs8, base_cb.ys8,
+                        max_images=max_queries, width=cw, height=ch,
+                        device=device)
+        scorer = CascadeGpuScorer(base_cb, max_queries=max_queries,
+                                  device=device)
+        core = {"pre": pre, "sd": sd, "ss": ss,
+                "scorer": scorer, "_cfg": None}
+        _GPU_CORE_CACHE[key] = core
+        _GPU_CORE_CACHE.move_to_end(key)
+        while len(_GPU_CORE_CACHE) > _GPU_CORE_MAX:
+            _GPU_CORE_CACHE.popitem(last=False)
     return core
-
-
-def _shared_preprocess(max_queries: int, width: int, height: int,
-                       trim_blue: bool = True, align: str = "top-center",
-                       fit_width: bool = False, unmask: float = 0.0):
-    """Return the process-wide GpuPreprocess for a canvas/config, shared by codebooks."""
-    from .gpu_preprocess import GpuPreprocess
-    key = (max_queries, width, height, trim_blue, align, fit_width, unmask)
-    pre = _PREPROCESS_CACHE.get(key)
-    if pre is None:
-        pre = GpuPreprocess(max_images=max_queries, width=width, height=height,
-                            trim_blue=trim_blue, align=align,
-                            fit_width=fit_width, unmask=unmask)
-        _PREPROCESS_CACHE[key] = pre
-    return pre
 
 
 def _query(cb: CascadeCodebook, query: Path | np.ndarray,
@@ -135,12 +140,31 @@ def _query(cb: CascadeCodebook, query: Path | np.ndarray,
 
 def recognize_cascade(cb: CascadeCodebook, query: Path | np.ndarray,
                       k: int = K_DEFAULT, top_n: int = TOP_N_DEFAULT,
-                      trim_blue: bool = True, shift_y: int = SHIFT_Y_DEFAULT,
-                      refine: int = REFINE_NCC, align: str = "top-center",
-                      fit_width: bool = False,
-                      unmask: float = 0.0,
+                      trim_blue: bool | None = None,
+                      shift_y: int | None = None,
+                      refine: int | None = None,
+                      align: str | None = None,
+                      fit_width: bool | None = None,
+                      unmask: float | None = None,
                       region: tuple[float, float, float, float] | None = None):
-    """Return top-k (index, path, score) via histogram prune -> sparse NCC."""
+    """Return top-k (index, path, score) via histogram prune -> sparse NCC.
+
+    ``None`` preprocessing args read the codebook's recorded params; ``refine``
+    defaults to the full ``top_n`` so CPU and GPU refine the same candidates.
+    """
+    p = cb.params
+    if trim_blue is None:
+        trim_blue = p.get("trim_blue", True)
+    if shift_y is None:
+        shift_y = p.get("shift_y", SHIFT_Y_DEFAULT)
+    if align is None:
+        align = p.get("align", "top-center")
+    if fit_width is None:
+        fit_width = p.get("fit_width", False)
+    if unmask is None:
+        unmask = float(p.get("unmask") or 0.0)
+    if refine is None:
+        refine = min(top_n, len(cb.paths))
     if region is not None:
         cb = region_codebook(cb, region)
     q8, qv8, f = _query(cb, query, trim_blue, shift_y, align,
@@ -194,6 +218,7 @@ class CascadeShipRecognizer:
         self.shift_y = (p.get("shift_y", SHIFT_Y_DEFAULT) if shift_y is None
                         else shift_y)
         self.align = p.get("align", "top-center") if align is None else align
+        _align_codes(self.align)   # fail fast on invalid alignment strings
         self.fit_width = (p.get("fit_width", False) if fit_width is None
                           else fit_width)
         self.unmask = (float(p.get("unmask") or 0.0) if unmask is None
@@ -210,7 +235,8 @@ class CascadeShipRecognizer:
                 # wgpu missing / no device / shader compile failed: degrade
                 # to CPU. Other exceptions (bad codebook layout, programming
                 # errors) propagate instead of being silently swallowed.
-                print(f"GPU cascade unavailable ({exc}); falling back to CPU")
+                _LOG.warning("GPU cascade unavailable (%s); falling back to CPU",
+                             exc)
                 self._gpu = None
 
     def _build_gpu(self, max_queries: int):
@@ -219,13 +245,14 @@ class CascadeShipRecognizer:
     def _apply_gpu_config(self, g: dict) -> None:
         """Point the shared GPU core at this recognizer's config."""
         cfg = (bool(self.fit_width), float(self.unmask or 0.0),
-               self.region, bool(self.trim_blue))
+               self.region, bool(self.trim_blue), self.align)
         if g.get("_cfg") == cfg:
             return
         pre, sd, sc = g["pre"], g["sd"], g["scorer"]
         pre.fit_width = bool(self.fit_width)
         pre.unmask = float(self.unmask or 0.0)
         pre.trim_blue = bool(self.trim_blue)
+        pre.halign, pre.valign = _align_codes(self.align)
         sd.set_region(self.region)
         sc.set_region(self.region)
         g["_cfg"] = cfg
@@ -278,6 +305,8 @@ class CascadeShipRecognizer:
             min_confidence = self.min_confidence
         single = not isinstance(images, (list, tuple))
         image_list = [images] if single else list(images)
+        if not image_list:
+            return []
         if self._gpu is not None:
             results: list = []
             # auto-chunk so a huge input never exceeds the GPU buffer size
@@ -295,6 +324,7 @@ class CascadeShipRecognizer:
     def _cpu_one(self, img, k: int):
         return recognize_cascade(self.cb, img, k, self.top_n,
                                  self.trim_blue, self.shift_y,
+                                 refine=self.top_n,
                                  align=self.align, fit_width=self.fit_width,
                                  unmask=self.unmask)
 
@@ -330,7 +360,7 @@ class CascadeShipRecognizer:
             c = cand[i]
             sc = match_codebook(cb.get_normed8()[c], cb.samples8[c], cb.valid8[c],
                                 cb.common8, q8[i].astype(np.float32),
-                                qv8[i], refine=REFINE_NCC)
+                                qv8[i], refine=self.top_n)
             o = np.argsort(sc)[::-1][:k]
             outs.append([(int(c[j]), cb.paths[int(c[j])], float(sc[j]))
                          for j in o])
@@ -365,6 +395,10 @@ class CascadeShipRecognizer:
         self._apply_gpu_config(g)
         arrs = [self._to_rgba(img) for img in image_list]
         m = len(arrs)
+        k_eff = min(k, self.top_n, len(self.cb.paths))
+        top_eff = min(self.top_n, len(self.cb.paths))
+        if m == 0 or k_eff <= 0 or top_eff <= 0:
+            return [[] for _ in range(m)]
         pre.upload(arrs, self.shift_y)
         # ONE command buffer, three passes: bbox -> clear hist -> fused
         # resize/sample/score. Everything stays GPU-resident (processed image
@@ -387,17 +421,17 @@ class CascadeShipRecognizer:
                               m=m)
         p3.end()
         p4 = encoder.begin_compute_pass()
-        sc.enqueue_prune(p4, sd, m, k, self.top_n)
+        sc.enqueue_prune(p4, sd, m, k_eff, top_eff)
         p4.end()
         p5 = encoder.begin_compute_pass()
-        sc.enqueue_select(p5, sd, m, k, self.top_n)
+        sc.enqueue_select(p5, sd, m, k_eff, top_eff)
         p5.end()
         pre.device.queue.submit([encoder.finish()])
-        idx, scores = sc.read_topk(m, k)   # readback blocks until the GPU finishes
+        idx, scores = sc.read_topk(m, k_eff)  # readback blocks until the GPU finishes
         outs = []
         for i in range(m):
             outs.append([(int(idx[i, r]), self.cb.paths[int(idx[i, r])],
-                          float(scores[i, r])) for r in range(k)])
+                          float(scores[i, r])) for r in range(k_eff)])
         return outs
 
 
@@ -445,8 +479,15 @@ class CascadeRecognizer(Generic[T]):
         # (the codebook build directory) — short, readable, and unique even when
         # bare filenames repeat across set/id subdirectories.
         self._paths = [str(p) for p in self._rec.cb.paths]
-        root = Path(os.path.commonpath(self._paths))
-        self._keys = [str(Path(p).relative_to(root)) for p in self._paths]
+        if self._paths:
+            # Common root over the PARENT directories, so a single-image
+            # codebook gets "card.png" instead of ".".
+            parents = [str(Path(p).parent) for p in self._paths]
+            root = Path(os.path.commonpath(parents))
+            self._keys = [str(Path(p).relative_to(root))
+                          for p in self._paths]
+        else:
+            self._keys = []
 
     @property
     def paths(self) -> list[str]:

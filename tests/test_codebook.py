@@ -13,7 +13,11 @@ from cascade_ncc.codebook import (
     region_codebook,
 )
 from cascade_ncc.codebook_match import match_codebook, normalize_common
-from cascade_ncc.recognizer import CascadeShipRecognizer, recognize_cascade
+from cascade_ncc.recognizer import (
+    CascadeRecognizer,
+    CascadeShipRecognizer,
+    recognize_cascade,
+)
 from tests.conftest import _write_gallery
 
 _BUILD = {"step": 2, "ncc_step": 4, "ncc_pool": 3}   # small + fast
@@ -223,3 +227,79 @@ def test_recognizer_cpu_batch_equals_single(tmp_path):
     assert [x[1] for x in batch[1]] == [x[1] for x in single2]
     for b, s in ((batch[0], single1), (batch[1], single2)):
         assert [round(x[2], 6) for x in b] == [round(x[2], 6) for x in s]
+
+
+def test_build_rejects_nondefault_histogram_params(tmp_path):
+    paths = _write_gallery(tmp_path, 4)
+    with pytest.raises(ValueError, match="hue_bins=16"):
+        build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                               hue_bins=8, **_BUILD)
+    with pytest.raises(ValueError, match=r"\(3, 3\)"):
+        build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                               cells=(2, 3), **_BUILD)
+
+
+def test_build_rejects_invalid_geometry(tmp_path):
+    paths = _write_gallery(tmp_path, 4)
+    with pytest.raises(ValueError, match="ncc_step must be >= step"):
+        build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                               step=2, ncc_step=1, ncc_pool=3)
+    with pytest.raises(ValueError, match="multiple of step"):
+        build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                               step=2, ncc_step=5, ncc_pool=3)
+    with pytest.raises(ValueError, match="top_fraction"):
+        build_cascade_codebook(paths, cache_path=tmp_path / "cb.npz",
+                               top_fraction=0.0, **_BUILD)
+
+
+def test_cascade_recognizer_single_image_key(tmp_path):
+    paths = _write_gallery(tmp_path, 1)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0, **_BUILD)
+    rec = CascadeRecognizer(cb_path.read_bytes(), use_gpu=False)
+    assert rec.keys == ["card_0.png"]
+
+
+def test_cpu_batch_step1_matches_single(tmp_path):
+    """step=1/ncc_pool=1 must not break the vectorized CPU batch path."""
+    paths = _write_gallery(tmp_path, 2)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           step=1, ncc_step=2, ncc_pool=1,
+                           trim_blue=False, shift_y=0)
+    rec = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                trim_blue=False, shift_y=0)
+    arrs = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+    batch = rec.recognize(arrs, k=3)
+    for i, arr in enumerate(arrs):
+        single = rec.recognize(arr, k=3)
+        assert [x[0] for x in batch[i]] == [x[0] for x in single]
+        assert [round(x[2], 6) for x in batch[i]] == \
+               [round(x[2], 6) for x in single]
+
+
+def test_recognize_empty_list_returns_empty(tmp_path):
+    paths = _write_gallery(tmp_path, 2)
+    cb_path = tmp_path / "cb.npz"
+    build_cascade_codebook(paths, cache_path=cb_path,
+                           trim_blue=False, shift_y=0, **_BUILD)
+    rec = CascadeShipRecognizer(str(cb_path), use_gpu=False,
+                                trim_blue=False, shift_y=0)
+    assert rec.recognize([]) == []
+
+
+def test_recognize_cascade_reads_codebook_params(tmp_path):
+    """Functional API defaults to codebook params like the class interface."""
+    paths = _write_gallery(tmp_path, 2)
+    cb_path = tmp_path / "cb.npz"
+    cb = build_cascade_codebook(paths, cache_path=cb_path,
+                                trim_blue=False, shift_y=2, fit_width=True,
+                                unmask=0.0, **_BUILD)
+    arr = np.asarray(Image.open(paths[0]).convert("RGBA"))
+    implicit = recognize_cascade(cb, arr, k=1, top_n=20)
+    explicit = recognize_cascade(cb, arr, k=1, top_n=20,
+                                 trim_blue=False, shift_y=2,
+                                 align="top-center", fit_width=True,
+                                 unmask=0.0)
+    assert implicit == explicit

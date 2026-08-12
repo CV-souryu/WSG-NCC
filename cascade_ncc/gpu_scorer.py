@@ -20,10 +20,15 @@ from __future__ import annotations
 import numpy as np
 
 from ._constants import (
+    CH,
+    CW,
     HIST_DIM,
+    HUE_BINS,
     K_DEFAULT,
+    LIG_BINS,
     MAX_CANDIDATES,
     MAX_QUERIES_DEFAULT,
+    SAT_BINS,
     TOP_N_DEFAULT,
 )
 from ._gpu import (
@@ -203,8 +208,8 @@ fn select_topk(@builtin(workgroup_id) img_v: vec3<u32>,
         }
         workgroupBarrier();
     } else {
-        if (ltid < topn) {
-            let c = cand[ltid];
+        for (var cc: u32 = ltid; cc < topn; cc = cc + 256u) {
+            let c = cand[cc];
             var cnt = 0.0; var sg = 0.0; var sq = 0.0; var sg2 = 0.0; var sq2 = 0.0; var sgq = 0.0;
             for (var pp: u32 = 0u; pp < npts; pp = pp + 1u) {
                 let pt = spts[pp / 3u];
@@ -225,8 +230,8 @@ fn select_topk(@builtin(workgroup_id) img_v: vec3<u32>,
                 let cv = sgq / cnt - mg * mq;
                 ex = cv / sqrt(max(vg * vq, 1e-12));
             }
-            texact[ltid] = ex;
-            tglidx[ltid] = c;
+            texact[cc] = ex;
+            tglidx[cc] = c;
         }
         workgroupBarrier();
     }
@@ -316,14 +321,16 @@ class CascadeGpuScorer:
         params = np.zeros(PARAM_UINTS, np.uint32)
         params[:6] = [m, ng, npts, HIST_DIM, k, top_n]
         params[6:10] = bits
-        params[10] = p["cw"]
-        params[11] = p["ch"]
-        params[12] = p["hue_bins"] * p["sat_bins"] * p["lig_bins"]
+        params[10] = p.get("cw", CW)
+        params[11] = p.get("ch", CH)
+        params[12] = (p.get("hue_bins", HUE_BINS)
+                      * p.get("sat_bins", SAT_BINS)
+                      * p.get("lig_bins", LIG_BINS))
         return params
 
     def score(self, feats: np.ndarray, q8: np.ndarray, qv8: np.ndarray,
               k: int = K_DEFAULT, top_n: int = TOP_N_DEFAULT):
-        """Two dispatches; returns (idx, scores) arrays of shape (M, k).
+        """Two dispatches; returns (idx, scores) of shape (M, min(k, top_n, ng)).
 
         Serialized by the global GPU lock (the shared device + working buffers
         are not thread-safe).
@@ -336,11 +343,16 @@ class CascadeGpuScorer:
         m = feats.shape[0]
         if m > self.max_queries:
             raise ValueError(f"{m} queries exceed max_queries {self.max_queries}")
+        ng = len(self.cb.paths)
+        top_n = min(top_n, ng)
+        k = min(k, top_n)
         if k > MAX_CANDIDATES or top_n > MAX_CANDIDATES:
             raise ValueError(
                 f"k={k} / top_n={top_n} exceed MAX_CANDIDATES {MAX_CANDIDATES}")
+        if m == 0 or top_n <= 0 or k <= 0:
+            return (np.empty((m, 0), np.uint32),
+                    np.empty((m, 0), np.float32))
         npts = len(self.cb.common8)
-        ng = len(self.cb.paths)
         # Standalone-only: the query buffers are transient here (the fused path
         # reads them from the sampler's GPU buffers instead), so allocate them
         # locally and let them be GC'd after the readback.
@@ -379,9 +391,13 @@ class CascadeGpuScorer:
         The prune ranks RAW histogram counts — a constant per-image scale does
         not change the top-N order.
         """
+        top_n = min(top_n, self.ngallery)
+        k = min(k, top_n)
         if k > MAX_CANDIDATES or top_n > MAX_CANDIDATES:
             raise ValueError(
                 f"k={k} / top_n={top_n} exceed MAX_CANDIDATES {MAX_CANDIDATES}")
+        if top_n <= 0 or k <= 0:
+            return
         npts = len(self.cb.common8)
         upload(self.device, self.p_buf,
                self._params(m, self.ngallery, npts, k, top_n))
@@ -395,9 +411,13 @@ class CascadeGpuScorer:
         Must run after ``enqueue_prune`` (same command buffer, later pass) so
         ``scores_buf`` holds the pruned scores for this image.
         """
+        top_n = min(top_n, self.ngallery)
+        k = min(k, top_n)
         if k > MAX_CANDIDATES or top_n > MAX_CANDIDATES:
             raise ValueError(
                 f"k={k} / top_n={top_n} exceed MAX_CANDIDATES {MAX_CANDIDATES}")
+        if top_n <= 0 or k <= 0:
+            return
         npts = len(self.cb.common8)
         upload(self.device, self.p_buf,
                self._params(m, self.ngallery, npts, k, top_n))

@@ -132,6 +132,10 @@ shift_y=4, align="top-center", name=None, cache_path=None, force=False)`
 从 gallery 图片列表构建码本，返回 `CascadeCodebook`。给 `name` 会自动缓存到
 `data/codebooks/<name>.npz`；`cache_path` 可指定其它路径；`force=True` 强制重建。
 
+> 直方图分箱固定为 **H16S2L2 × 3×3**（`hue_bins=16`、`sat_bins=2`、
+> `lig_bins=2`、`cells=(3,3)`）：WGSL GPU 内核硬编码这些维度，传其它值会在
+> 构建时报错，避免 GPU 路径静默算错。
+
 > **构建不缩放**：码本构建要求所有 gallery 图与画布 `cw × ch`（默认 `124 × 240`）
 > 完全同尺寸，否则直接报错——长宽比不一的图请先统一裁切/预处理到画布尺寸，
 > 而不是靠构建时的隐式拉伸（拉伸会让码点与查询预处理后的画布对不齐）。
@@ -139,10 +143,12 @@ shift_y=4, align="top-center", name=None, cache_path=None, force=False)`
 `load_cascade_codebook(name_or_path)` 按名字（如 `"cascade"`）、`.npz` 路径或
 `.npz` 原始 bytes 加载码本。
 
-`recognize_cascade(cb, query, k=3, top_n=20, trim_blue=True, shift_y=4,
-refine=50, align="top-center", fit_width=False, unmask=0.0,
-region=None)` 纯 CPU 单图识别，返回
+`recognize_cascade(cb, query, k=3, top_n=20, trim_blue=None, shift_y=None,
+refine=None, align=None, fit_width=None, unmask=None, region=None)`
+纯 CPU 单图识别，返回
 `[(gallery_index, Path, score), ...]`，按分数从高到低。
+预处理参数传 `None` 时从码本 `params` 读取；`refine=None` 精确打分整个
+`top_n` 候选集（与 GPU 路径一致）。
 
 ### 公开类
 
