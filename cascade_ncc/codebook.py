@@ -235,14 +235,11 @@ def region_codebook(cb: CascadeCodebook,
     cw, ch = _canvas(cb)
     sp_mask = region_point_mask(cb.xs8, cb.ys8, cw, ch, region)
     common8 = cb.common8 & np.repeat(sp_mask, 3)
-    hist = cb.hist * hist_mask[None, :]
-    norms = np.linalg.norm(hist, axis=1, keepdims=True)
-    hist = np.divide(hist, np.maximum(norms, EPS),
-                     out=np.zeros_like(hist), where=norms > EPS)
-    return replace(cb, hist=hist,
+    return replace(cb, hist=cb.hist,
                    hist_mask=hist_mask,
+                   hist_cache=None,
                    common8=common8,
-                   normed8=_normalize(cb.samples8, common8))
+                   normed8=None)
 
 
 def _geometry(step: int, ncc_step: int, top_fraction: float,
@@ -277,6 +274,25 @@ class CascadeCodebook:
     normed8: np.ndarray       # (N, C*3) normalized sparse RGB NCC vectors
     params: dict
     hist_mask: np.ndarray | None = None    # 576-d bucket mask (region activation)
+    hist_cache: np.ndarray | None = None   # lazy region-restricted hist
+
+    def get_hist(self) -> np.ndarray:
+        """Full or region-restricted (lazily recomputed) gallery histogram."""
+        if self.hist_mask is None:
+            return self.hist
+        if self.hist_cache is None:
+            h = self.hist * self.hist_mask[None, :]
+            norms = np.linalg.norm(h, axis=1, keepdims=True)
+            self.hist_cache = np.divide(
+                h, np.maximum(norms, EPS),
+                out=np.zeros_like(h), where=norms > EPS)
+        return self.hist_cache
+
+    def get_normed8(self) -> np.ndarray:
+        """Sparse NCC vectors, lazily recomputed for region-masked common8."""
+        if self.normed8 is None:
+            self.normed8 = _normalize(self.samples8, self.common8)
+        return self.normed8
 
 
 def _cache_key(paths: list[Path], params: dict) -> str:

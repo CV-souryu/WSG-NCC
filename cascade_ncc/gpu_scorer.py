@@ -38,7 +38,7 @@ from ._gpu import (
     upload,
 )
 
-PARAM_UINTS = 6         # nimg, ngallery, npts, hdim, k, topn
+PARAM_UINTS = 13        # + region(4 f32 bits), cw, ch, color_bins
 
 # One WGSL source, translated at runtime by naga to MSL / SPIR-V / HLSL.
 # The byte-typed gallery/query arrays are u32 arrays holding one 0-255 value
@@ -59,11 +59,34 @@ fn prune_scores(@builtin(global_invocation_id) gid: vec3<u32>) {
     let img = gid.y;
     let ng = pparams[1]; let hdim = pparams[3];
     if (j >= ng || img >= pparams[0]) { return; }
+    let cw = pparams[10]; let ch = pparams[11];
+    let color_bins = pparams[12];
+    let rt = bitcast<f32>(pparams[6]);
+    let rb = bitcast<f32>(pparams[7]);
+    let rl = bitcast<f32>(pparams[8]);
+    let rr = bitcast<f32>(pparams[9]);
+    let y0 = rt / 100.0 * f32(ch);
+    let y1 = rb / 100.0 * f32(ch);
+    let x0 = rl / 100.0 * f32(cw);
+    let x1 = rr / 100.0 * f32(cw);
     var s = 0.0;
-    for (var d: u32 = 0u; d < hdim; d = d + 1u) {
-        s = s + hist[j * hdim + d] * f32(feats[img * hdim + d]);
+    var n2 = 0.0;
+    let ncell = hdim / color_bins;
+    for (var cell: u32 = 0u; cell < ncell; cell = cell + 1u) {
+        let cy = cell / 3u; let cx = cell % 3u;
+        let cyc = (f32(cy) + 0.5) * f32(ch) / 3.0;
+        let cxc = (f32(cx) + 0.5) * f32(cw) / 3.0;
+        let on = select(0.0, 1.0,
+                        cyc >= y0 && cyc <= y1 && cxc >= x0 && cxc <= x1);
+        let dbase = cell * color_bins;
+        for (var c: u32 = 0u; c < color_bins; c = c + 1u) {
+            let d = dbase + c;
+            let g = hist[j * hdim + d] * on;
+            s = s + g * f32(feats[img * hdim + d]);
+            n2 = n2 + g * g;
+        }
     }
-    pscores[img * ng + j] = s;
+    pscores[img * ng + j] = s / sqrt(max(n2, 1e-12));
 }
 
 @group(0) @binding(0) var<storage, read>      sscores: array<f32>;
@@ -75,6 +98,7 @@ fn prune_scores(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(6) var<storage, read_write> out_scores: array<f32>;
 @group(0) @binding(7) var<storage, read_write> out_idx: array<u32>;
 @group(0) @binding(8) var<storage, read>      sparams: array<u32>;
+@group(0) @binding(9) var<storage, read>      spts: array<vec2<f32>>;
 
 var<workgroup> cand: array<u32, MAX_CANDIDATES>;
 var<workgroup> texact: array<f32, MAX_CANDIDATES>;
@@ -93,6 +117,15 @@ fn select_topk(@builtin(workgroup_id) img_v: vec3<u32>,
     let ltid = ltid_v.x;
     let ng = sparams[1]; let npts = sparams[2];
     let k = sparams[4]; let topn = sparams[5];
+    let cw = sparams[10]; let ch = sparams[11];
+    let rt = bitcast<f32>(sparams[6]);
+    let rb = bitcast<f32>(sparams[7]);
+    let rl = bitcast<f32>(sparams[8]);
+    let rr = bitcast<f32>(sparams[9]);
+    let y0 = rt / 100.0 * f32(ch);
+    let y1 = rb / 100.0 * f32(ch);
+    let x0 = rl / 100.0 * f32(cw);
+    let x1 = rr / 100.0 * f32(cw);
     // 1. top-N: thread 0 keeps the N best indices (reads global scores)
     if (ltid == 0u) {
         var top_idx: array<u32, MAX_CANDIDATES>;
@@ -127,7 +160,9 @@ fn select_topk(@builtin(workgroup_id) img_v: vec3<u32>,
             let gidx = cand[c];
             var cnt = 0.0; var sg = 0.0; var sq = 0.0; var sg2 = 0.0; var sq2 = 0.0; var sgq = 0.0;
             for (var pp: u32 = tl; pp < npts; pp = pp + tc) {
-                if (cmn[pp] != 0u && valid[gidx * npts + pp] != 0u
+                let pt = spts[pp / 3u];
+                let rok = pt.y >= y0 && pt.y <= y1 && pt.x >= x0 && pt.x <= x1;
+                if (cmn[pp] != 0u && rok && valid[gidx * npts + pp] != 0u
                     && qv8[img * npts + pp] != 0u) {
                     let gp = f32(samples[gidx * npts + pp]);
                     let qp = f32(q8[img * npts + pp]);
@@ -168,7 +203,9 @@ fn select_topk(@builtin(workgroup_id) img_v: vec3<u32>,
             let c = cand[ltid];
             var cnt = 0.0; var sg = 0.0; var sq = 0.0; var sg2 = 0.0; var sq2 = 0.0; var sgq = 0.0;
             for (var pp: u32 = 0u; pp < npts; pp = pp + 1u) {
-                if (cmn[pp] != 0u && valid[c * npts + pp] != 0u
+                let pt = spts[pp / 3u];
+                let rok = pt.y >= y0 && pt.y <= y1 && pt.x >= x0 && pt.x <= x1;
+                if (cmn[pp] != 0u && rok && valid[c * npts + pp] != 0u
                     && qv8[img * npts + pp] != 0u) {
                     let gp = f32(samples[c * npts + pp]);
                     let qp = f32(q8[img * npts + pp]);
@@ -229,7 +266,8 @@ class CascadeGpuScorer:
             {"prune_scores": ["read-only-storage", "read-only-storage",
                               "storage", "read-only-storage"],
              "select_topk": ["read-only-storage"] * 6
-                            + ["storage", "storage"] + ["read-only-storage"]},
+                            + ["storage", "storage"]
+                            + ["read-only-storage", "read-only-storage"]},
             "GPU scorer")
         self.prune_pipe, self.prune_bgl = self.pipelines["prune_scores"]
         self.select_pipe, self.select_bgl = self.pipelines["select_topk"]
@@ -245,6 +283,9 @@ class CascadeGpuScorer:
         self.common_buf = create_buffer(self.device, npts * 4)
         upload(self.device, self.common_buf,
               np.asarray(cb.common8, np.uint8).ravel().astype(np.uint32))
+        self.spts_buf = create_buffer(self.device, len(cb.xs8) * 8)
+        upload(self.device, self.spts_buf,
+              np.stack([cb.xs8, cb.ys8], axis=1))
         # Query working buffers (feats/q8/qv8) are NOT resident: the fused path
         # reads them from the sampler's GPU buffers, and the standalone score()
         # allocates them locally. Only the result + prune buffers persist.
@@ -257,6 +298,24 @@ class CascadeGpuScorer:
         self.scores_buf = create_buffer(
             self.device, max_queries * ng * 4)
         self.p_buf = create_buffer(self.device, PARAM_UINTS * 4)
+        self._region: tuple[float, float, float, float] | None = None
+
+    def set_region(self, region: tuple[float, float, float, float] | None) -> None:
+        """Set launch-time region percentages (no per-config buffer uploads)."""
+        self._region = None if region is None else tuple(float(v) for v in region)
+
+    def _params(self, m: int, ng: int, npts: int,
+                k: int, top_n: int) -> np.ndarray:
+        p = self.cb.params
+        region = self._region or (0.0, 100.0, 0.0, 100.0)
+        bits = np.frombuffer(np.array(region, np.float32).tobytes(), np.uint32)
+        params = np.zeros(PARAM_UINTS, np.uint32)
+        params[:6] = [m, ng, npts, HIST_DIM, k, top_n]
+        params[6:10] = bits
+        params[10] = p["cw"]
+        params[11] = p["ch"]
+        params[12] = p["hue_bins"] * p["sat_bins"] * p["lig_bins"]
+        return params
 
     def score(self, feats: np.ndarray, q8: np.ndarray, qv8: np.ndarray,
               k: int = K_DEFAULT, top_n: int = TOP_N_DEFAULT):
@@ -290,8 +349,7 @@ class CascadeGpuScorer:
               np.ascontiguousarray(q8, np.uint8).ravel().astype(np.uint32))
         upload(self.device, qv8_buf,
               np.ascontiguousarray(qv8, np.uint8).ravel().astype(np.uint32))
-        upload(self.device, self.p_buf,
-               np.asarray([m, ng, npts, HIST_DIM, k, top_n], np.uint32))
+        upload(self.device, self.p_buf, self._params(m, ng, npts, k, top_n))
         encoder = self.device.create_command_encoder()
         p1 = encoder.begin_compute_pass()
         enqueue(p1, self.device, self.prune_pipe, self.prune_bgl,
@@ -303,7 +361,8 @@ class CascadeGpuScorer:
                 [self.scores_buf, self.samples_buf, self.valid_buf,
                  self.common_buf, q8_buf, qv8_buf,
                  (self.out_buf, 0, self._seg),
-                 (self.out_buf, self._seg, self._seg), self.p_buf], m)
+                 (self.out_buf, self._seg, self._seg), self.p_buf,
+                 self.spts_buf], m)
         p2.end()
         self.device.queue.submit([encoder.finish()])
         return self.read_topk(m, k)
@@ -321,7 +380,7 @@ class CascadeGpuScorer:
                 f"k={k} / top_n={top_n} exceed MAX_CANDIDATES {MAX_CANDIDATES}")
         npts = len(self.cb.common8)
         upload(self.device, self.p_buf,
-               np.asarray([m, self.ngallery, npts, HIST_DIM, k, top_n], np.uint32))
+               self._params(m, self.ngallery, npts, k, top_n))
         enqueue(pass_, self.device, self.prune_pipe, self.prune_bgl,
                 [self.hist_buf, sd.hist_buf, self.scores_buf, self.p_buf],
                 ((self.ngallery + 255) // 256, m))
@@ -337,13 +396,14 @@ class CascadeGpuScorer:
                 f"k={k} / top_n={top_n} exceed MAX_CANDIDATES {MAX_CANDIDATES}")
         npts = len(self.cb.common8)
         upload(self.device, self.p_buf,
-               np.asarray([m, self.ngallery, npts, HIST_DIM, k, top_n], np.uint32))
+               self._params(m, self.ngallery, npts, k, top_n))
         enqueue(pass_, self.device, self.select_pipe, self.select_bgl,
                 [self.scores_buf, self.samples_buf,
                  self.valid_buf, self.common_buf,
                  sd.sa_srgb_buf, sd.sa_svalid_buf,
                  (self.out_buf, 0, self._seg),
-                 (self.out_buf, self._seg, self._seg), self.p_buf], m)
+                 (self.out_buf, self._seg, self._seg), self.p_buf,
+                 self.spts_buf], m)
 
     def read_topk(self, m, k):
         """Read the combined [scores | idx] buffer in ONE readback and split."""

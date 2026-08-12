@@ -49,6 +49,43 @@ from .primitives import _pooled_multi, preprocess_card
 # canvas — so one instance per (max_queries, canvas) serves every codebook.
 # On-demand serial inference keeps this safe.
 _PREPROCESS_CACHE: dict = {}
+_GPU_CORE_CACHE: dict = {}
+
+
+def _gpu_core(base_cb: CascadeCodebook, max_queries: int) -> dict:
+    """Shared GPU working buffers for one codebook; configs re-point small buffers."""
+    from ._gpu import default_device
+    from .gpu_preprocess import GpuPreprocess
+    from .gpu_sampler import GpuSampler
+    from .gpu_scorer import CascadeGpuScorer
+    cw, ch = _canvas(base_cb)
+    key = (id(base_cb), max_queries, cw, ch)
+    core = _GPU_CORE_CACHE.get(key)
+    if core is None:
+        with GPU_LOCK:
+            core = _GPU_CORE_CACHE.get(key)
+            if core is None:
+                p = base_cb.params
+                device = default_device()
+                pre = GpuPreprocess(
+                    max_images=max_queries, width=cw, height=ch,
+                    trim_blue=p.get("trim_blue", True),
+                    align=p.get("align", "top-center"),
+                    fit_width=p.get("fit_width", False),
+                    unmask=p.get("unmask") or 0.0, device=device)
+                sd = GpuSampler(base_cb.xs, base_cb.ys,
+                                max_images=max_queries, width=cw, height=ch,
+                                device=device)
+                sd.set_common(base_cb.common)
+                ss = GpuSampler(base_cb.xs8, base_cb.ys8,
+                                max_images=max_queries, width=cw, height=ch,
+                                device=device)
+                scorer = CascadeGpuScorer(base_cb, max_queries=max_queries,
+                                          device=device)
+                core = {"pre": pre, "sd": sd, "ss": ss,
+                        "scorer": scorer, "_cfg": None}
+                _GPU_CORE_CACHE[key] = core
+    return core
 
 
 def _shared_preprocess(max_queries: int, width: int, height: int,
@@ -111,8 +148,8 @@ def recognize_cascade(cb: CascadeCodebook, query: Path | np.ndarray,
         cb = region_codebook(cb, region)
     q8, qv8, f = _query(cb, query, trim_blue, shift_y, align,
                         fit_width=fit_width, unmask=unmask)
-    cand = np.argsort(cb.hist @ f)[::-1][:top_n]
-    scores = match_codebook(cb.normed8[cand], cb.samples8[cand],
+    cand = np.argsort(cb.get_hist() @ f)[::-1][:top_n]
+    scores = match_codebook(cb.get_normed8()[cand], cb.samples8[cand],
                             cb.valid8[cand], cb.common8,
                             q8, qv8, refine=refine)
     local = np.argsort(scores)[::-1][:k]      # positions within cand
@@ -180,32 +217,20 @@ class CascadeShipRecognizer:
                 self._gpu = None
 
     def _build_gpu(self, max_queries: int):
-        from ._gpu import default_device
-        from .gpu_sampler import GpuSampler
-        from .gpu_scorer import CascadeGpuScorer
-        cw, ch = _canvas(self.cb)
-        # One shared device (process-wide) and one shared GpuPreprocess per
-        # canvas: pipelines + the ~30 MB query working set are shared across
-        # codebooks. Only the sampler/scorer carry per-codebook data (points,
-        # gallery) and are built fresh here.
-        device = default_device()
-        sd = GpuSampler(self.cb.xs, self.cb.ys, max_images=max_queries,
-                        width=cw, height=ch, device=device)
-        sd.set_common(self.cb.common)   # codebook constant: upload once, persist
-        if self.cb.hist_mask is not None:
-            p = self.cb.params
-            color_bins = (p["hue_bins"] * p["sat_bins"] * p["lig_bins"])
-            sd.set_cell_mask(self.cb.hist_mask[::color_bins])
-        return {
-            "pre": _shared_preprocess(max_queries, cw, ch,
-                                      self.trim_blue, self.align,
-                                      self.fit_width, self.unmask),
-            "sd": sd,
-            "ss": GpuSampler(self.cb.xs8, self.cb.ys8, max_images=max_queries,
-                             width=cw, height=ch, device=device),
-            "scorer": CascadeGpuScorer(self.cb, max_queries=max_queries,
-                                       device=device),
-        }
+        return _gpu_core(self._base_cb, max_queries)
+
+    def _apply_gpu_config(self, g: dict) -> None:
+        """Point the shared GPU core at this recognizer's config."""
+        cfg = (bool(self.fit_width), float(self.unmask or 0.0),
+               self.region)
+        if g.get("_cfg") == cfg:
+            return
+        pre, sd, sc = g["pre"], g["sd"], g["scorer"]
+        pre.fit_width = bool(self.fit_width)
+        pre.unmask = float(self.unmask or 0.0)
+        sd.set_region(self.region)
+        sc.set_region(self.region)
+        g["_cfg"] = cfg
 
     def _override_recognizer(self, fit_width, unmask, region):
         """A cached recognizer with temporary preprocessing/inference config."""
@@ -295,8 +320,8 @@ class CascadeShipRecognizer:
         rgb = np.stack([d[1], d[2], d[3]], axis=-1)          # (M, P, 3)
         feats = np.stack([codebook_hist(cb, rgb[i], qv[i])
                           for i in range(m)])
-        kth = min(self.top_n, cb.hist.shape[0])   # small codebooks: keep all
-        cand = np.argpartition(feats @ cb.hist.T, -kth, axis=1)[:, -self.top_n:]
+        kth = min(self.top_n, cb.get_hist().shape[0])  # small codebooks
+        cand = np.argpartition(feats @ cb.get_hist().T, -kth, axis=1)[:, -self.top_n:]
         s = _pooled_multi([a[..., 0], a[..., 1], a[..., 2], a[..., 3]],
                           cb.xs8, cb.ys8, p["ncc_pool"])
         q8 = np.clip(np.stack([s[0], s[1], s[2]], axis=-1), 0, 255) \
@@ -305,7 +330,7 @@ class CascadeShipRecognizer:
         outs = []
         for i in range(m):
             c = cand[i]
-            sc = match_codebook(cb.normed8[c], cb.samples8[c], cb.valid8[c],
+            sc = match_codebook(cb.get_normed8()[c], cb.samples8[c], cb.valid8[c],
                                 cb.common8, q8[i].astype(np.float32),
                                 qv8[i], refine=REFINE_NCC)
             o = np.argsort(sc)[::-1][:k]
@@ -339,6 +364,7 @@ class CascadeShipRecognizer:
         g = self._gpu
         p = self.cb.params
         pre, sd, ss, sc = g["pre"], g["sd"], g["ss"], g["scorer"]
+        self._apply_gpu_config(g)
         arrs = [self._to_rgba(img) for img in image_list]
         m = len(arrs)
         pre.upload(arrs, self.shift_y)

@@ -51,7 +51,6 @@ fn bilin(v00: f32, v10: f32, v01: f32, v11: f32, wx: f32, wy: f32) -> f32 {
 @group(0) @binding(5) var<storage, read_write> srgb: array<u32>;
 @group(0) @binding(6) var<storage, read_write> svalid: array<u32>;
 @group(0) @binding(7) var<storage, read>      sp: array<u32>;
-@group(0) @binding(8) var<storage, read>      cact: array<u32>;
 
 const HUE_BINS: u32 = 16u;
 const SAT_BINS: u32 = 2u;
@@ -116,8 +115,18 @@ fn sample_all(@builtin(workgroup_id) gid_v: vec3<u32>,
             let v = select(0u, 1u, asum * inv >= 127.5);
             let cx = min(u32(floor(pt.x * 3.0 / f32(width))), CELLS_X - 1u);
             let cy = min(u32(floor(pt.y * 3.0 / f32(height))), CELLS_Y - 1u);
-            let cidx = cy * CELLS_X + cx;
-            if (cmn[qid] != 0u && v == 1u && cact[cidx] != 0u) {
+            let cyc = (f32(cy) + 0.5) * f32(height) / f32(CELLS_Y);
+            let cxc = (f32(cx) + 0.5) * f32(width) / f32(CELLS_X);
+            let rt = bitcast<f32>(sp[7]);
+            let rb = bitcast<f32>(sp[8]);
+            let rl = bitcast<f32>(sp[9]);
+            let rr = bitcast<f32>(sp[10]);
+            let y0 = rt / 100.0 * f32(height);
+            let y1 = rb / 100.0 * f32(height);
+            let x0 = rl / 100.0 * f32(width);
+            let x1 = rr / 100.0 * f32(width);
+            let region_on = (cyc >= y0 && cyc <= y1 && cxc >= x0 && cxc <= x1);
+            if (cmn[qid] != 0u && v == 1u && region_on) {
                 let R = f32(clamp(rsum * inv, 0.0, 255.0));
                 let G = f32(clamp(gs2 * inv, 0.0, 255.0));
                 let B = f32(clamp(bs2 * inv, 0.0, 255.0));
@@ -239,7 +248,7 @@ class GpuSampler:
              "sample_all": ["read-only-storage", "read-only-storage",
                             "read-only-storage", "read-only-storage",
                             "storage", "storage", "storage",
-                            "read-only-storage", "read-only-storage"]},
+                            "read-only-storage"]},
             "GPU sampler")
         self.sa_pipeline, self.sa_bgl = self.pipelines["sample_all"]
         self.ch_pipeline, self.ch_bgl = self.pipelines["clear_hist"]
@@ -255,16 +264,13 @@ class GpuSampler:
             self.device, max_images * MAX_CANDIDATES * 3 * 4)  # grows on demand
         self.sa_svalid_buf = create_buffer(
             self.device, max_images * MAX_CANDIDATES * 3 * 4)
-        self.sa_params_buf = create_buffer(self.device, 28)
-        self.cell_active_buf = create_buffer(self.device, 9 * 4)
-        upload(self.device, self.cell_active_buf, np.ones(9, np.uint32))
+        self.sa_params_buf = create_buffer(self.device, 44)
+        self._region = (0.0, 100.0, 0.0, 100.0)
 
-    def set_cell_mask(self, mask: np.ndarray) -> None:
-        """Activate only the given 3x3 spatial cells (row-major, 9 values)."""
-        arr = np.asarray(mask, np.uint8).ravel().astype(np.uint32)
-        if arr.size != 9:
-            raise ValueError("cell mask must have 9 entries (3x3)")
-        upload(self.device, self.cell_active_buf, arr)
+    def set_region(self, region: tuple[float, float, float, float] | None) -> None:
+        """Set the launch-time region percentages for dense histogram sampling."""
+        self._region = ((0.0, 100.0, 0.0, 100.0) if region is None
+                        else tuple(float(v) for v in region))
 
     def set_common(self, common: np.ndarray) -> None:
         """Fill the dense common-mask buffer (this sampler owns it).
@@ -308,14 +314,17 @@ class GpuSampler:
             self.sa_srgb_buf = create_buffer(self.device, need)
             self.sa_svalid_buf = create_buffer(self.device, need)
         # hist_buf is zeroed on the GPU by enqueue_clear_hist, not here.
-        upload(self.device, self.sa_params_buf,
-               np.asarray([m, ndense, nsparse, self.width, self.height,
-                           dpool, spool], np.uint32))
+        region_bits = np.frombuffer(
+            np.array(self._region, np.float32).tobytes(), np.uint32)
+        params = np.zeros(11, np.uint32)
+        params[:7] = [m, ndense, nsparse, self.width, self.height,
+                      dpool, spool]
+        params[7:] = region_bits
+        upload(self.device, self.sa_params_buf, params)
         chunks_d = (ndense + 255) // 256
         chunks_s = (nsparse + 255) // 256
         enqueue(pass_, self.device, self.sa_pipeline, self.sa_bgl,
                 [img_buf, self.pts_buf, spts_buf, common_buf,
                  self.hist_buf, self.sa_srgb_buf,
-                 self.sa_svalid_buf, self.sa_params_buf,
-                 self.cell_active_buf],
+                 self.sa_svalid_buf, self.sa_params_buf],
                 m * (chunks_d + chunks_s))
