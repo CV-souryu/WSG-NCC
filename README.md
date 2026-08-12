@@ -48,31 +48,136 @@ data/groups/group1/testset/cards/001.png
 from cascade_ncc import (CascadeCodebook, CascadeRecognizer,
                          CascadeShipRecognizer, build_cascade_codebook,
                          load_cascade_codebook, recognize_cascade)
+```
 
-# 建库（自动缓存到 data/codebooks/<name>.npz）
+### 函数式接口
+
+`build_cascade_codebook(paths, step=2, ncc_step=8, ncc_pool=9, bins=8,
+min_common_frac=0.9, top_fraction=0.8, cw=124, ch=240, trim_blue=True,
+shift_y=4, align="top-center", name=None, cache_path=None, force=False)`
+从 gallery 图片列表构建码本，返回 `CascadeCodebook`。给 `name` 会自动缓存到
+`data/codebooks/<name>.npz`；`cache_path` 可指定其它路径；`force=True` 强制重建。
+
+`load_cascade_codebook(name_or_path)` 按名字（如 `"cascade"`）、`.npz` 路径或
+`.npz` 原始 bytes 加载码本。
+
+`recognize_cascade(cb, query, k=3, top_n=20, trim_blue=True, shift_y=4,
+refine=50, align="top-center")` 纯 CPU 单图识别，返回
+`[(gallery_index, Path, score), ...]`，按分数从高到低。
+
+### 公开类
+
+#### CascadeCodebook（码本数据类）
+
+不直接构造，由 `build_cascade_codebook` / `load_cascade_codebook` 返回。常用字段：
+
+- `paths: list[Path]`——gallery 绝对路径，按码本内顺序。
+- `hist: np.ndarray`——每张 gallery 的 512 维颜色直方图（粗筛特征）。
+- `samples8` / `valid8` / `common8` / `normed8`——稀疏 NCC 精确打分所需数据。
+- `params: dict`——构建参数（`step` / `ncc_step` / `ncc_pool` / `bins` /
+  `cw` / `ch` / `trim_blue` / `shift_y` / `align` 等），识别器会从这里读默认值。
+
+```python
 cb = build_cascade_codebook(gallery_paths, name="cascade")   # list[Path]
+cb = load_cascade_codebook("cascade")                        # 按名字
+cb = load_cascade_codebook("data/codebooks/cascade.npz")     # 按路径
+top = recognize_cascade(cb, "query.png", k=5, top_n=20)      # 直接喂函数
+```
 
-# 加载
-cb = load_cascade_codebook("cascade")              # 按名字
-cb = load_cascade_codebook("data/codebooks/cascade.npz")  # 按路径
+#### CascadeShipRecognizer（低层识别器：GPU 批量 / CPU）
 
-# 函数式识别：返回 [(gallery_index, Path, score), ...]
-top = recognize_cascade(cb, "query.png", k=5, top_n=20)
+```python
+CascadeShipRecognizer(
+    codebook="cascade",        # 名字 / .npz 路径 / bytes / 已加载的 CascadeCodebook
+    use_gpu=True,              # wgpu GPU 批量；不可用时自动回退 CPU
+    max_queries=128,           # 单批上限，超出自动分批
+    trim_blue=None,            # None = 从码本 params 读取
+    shift_y=None,              # None = 从码本 params 读取
+    top_n=20,                  # 粗筛候选数
+    align=None,                # None = 从码本 params 读取
+)
+```
 
-# 类接口：GPU 批量（默认）或 CPU
-r = CascadeShipRecognizer("cascade", use_gpu=True)     # GPU 批量（wgpu），自动回退 CPU
-top = r.recognize(img_rgba_u8, k=3)                    # 单图 -> 一个结果列表
-tops = r.recognize([img1, img2, ...], k=3)             # 批量 -> 每图一个列表
+`recognize(images, k=3)` 接受单张或批量输入（文件路径 / `(H, W, 3/4)` uint8
+数组），返回：
 
-# 高层接口：码本（路径或 .npz 字节）+ 元数据 dict，返回 (值, 置信度, key)
-from cascade_ncc import CascadeRecognizer
+- 单图输入：`[(gallery_index: int, gallery_path: Path, score: float), ...]`
+- 批量输入（`list` / `tuple`）：上面这个列表的列表，每张图一个。
+
+```python
+r = CascadeShipRecognizer("cascade", use_gpu=True)
+top = r.recognize(img_rgba_u8, k=3)          # 单图 -> 一个结果列表
+tops = r.recognize([img1, img2, ...], k=3)   # 批量 -> 每图一个结果列表
+```
+
+实例属性：`cb`（码本）、`trim_blue` / `shift_y` / `align`（生效的预处理配置）、
+`top_n`、`use_gpu`、`max_queries`。
+
+#### CascadeRecognizer（高层识别器：码本 + 元数据）
+
+在 `CascadeShipRecognizer` 之上加一层“值映射”：每个匹配返回
+`(value, confidence, key)`，其中 `key` 是匹配到的 gallery 路径相对构建目录的
+路径（如 `"1/226/XM_NORMAL_226.png"`），`value` 是 `meta[key]`（没有元数据时
+为 `None`）。
+
+```python
+CascadeRecognizer(
+    codebook,                  # 名字 / .npz 路径 / bytes
+    meta=None,                 # dict[key -> 任意值]，key 用相对路径
+    k=3,                       # 默认 top-k
+    use_gpu=True,
+    max_queries=128,
+    trim_blue=None,            # None = 从码本 params 读取
+    shift_y=None,
+    align=None,
+)
+```
+
+```python
 rec = CascadeRecognizer(codebook_path_or_bytes)
 meta = {key: key.split("/")[-1] for key in rec.keys}   # key → 自定义泛型值
 rec = CascadeRecognizer(codebook_path_or_bytes, meta=meta)
 top = rec.recognize(img_rgba_u8, k=3)   # [(值或None, 置信度, key), ...]
-#   key 形如 "1/226/XM_NORMAL_226.png"（相对 gallery 根目录，即构建目录）
-#   完整元数据（key → {shipIndex, title}）可由 ship_names.json 生成
+tops = rec.recognize([img1, img2], k=3) # 批量 -> 每图一个 [(值, 置信度, key), ...]
 ```
+
+属性：`paths`（gallery 绝对路径，码本顺序）、`keys`（对应的相对路径）。
+完整元数据（key → `{shipIndex, title}`）可由 `ship_names.json` 生成。
+
+#### 示例：识别船仓舰船卡片
+
+船仓截图先按卡片位置裁成单卡（本项目 `testset/cards/` 就是裁好的单卡），然后
+交给 `CascadeRecognizer.recognize`：
+
+```python
+import json
+from pathlib import Path
+
+from cascade_ncc import CascadeRecognizer
+
+# key（gallery 相对路径）→ 船名
+meta = {
+    key: info["title"]
+    for key, info in json.loads(
+        Path("data/gallery_meta.json").read_text(encoding="utf-8")
+    ).items()
+}
+
+rec = CascadeRecognizer("cascade", meta=meta, k=3)   # GPU，不可用时自动回退 CPU
+
+# 单张船卡
+top = rec.recognize("data/groups/group1/testset/cards/001.png")
+for ship, score, key in top:
+    print(f"{ship}  {score:.4f}  {key}")
+
+# 整个船仓的船卡批量识别
+cards = sorted(Path("data/groups/group1/testset/cards").glob("*.png"))
+for result in rec.recognize(cards, k=1):
+    ship, score, key = result[0]
+    print(f"{key}  ->  {ship}  {score:.4f}")
+```
+
+### 输入约定
 
 - **查询输入**：文件路径，或 `(H, W, 3/4)` 的 uint8 numpy 数组（RGB 或 RGBA），
   单图与批量走完全相同的预处理。
