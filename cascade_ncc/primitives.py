@@ -38,6 +38,34 @@ def numpy_resize(arr: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
     return _bilinear_at(arr, X, Y)
 
 
+_POOL_PLANS: dict = {}
+
+
+def _pool_plan(xs: np.ndarray, ys: np.ndarray, k: int, h: int, w: int):
+    """Bilinear pooling indices/weights, computed once per code-point set."""
+    key = (id(xs), id(ys), k, h, w)
+    plan = _POOL_PLANS.get(key)
+    if plan is not None:
+        return plan
+    r = (k - 1) / 2
+    offs = np.arange(k, dtype=np.float32) - r
+    ox, oy = np.meshgrid(offs, offs)
+    X = (xs[None, :] + ox.ravel()[:, None]).astype(np.float32)
+    Y = (ys[None, :] + oy.ravel()[:, None]).astype(np.float32)
+    x = np.clip(X, 0, w - 1); y = np.clip(Y, 0, h - 1)
+    x0 = np.floor(x).astype(np.int32); y0 = np.floor(y).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1); y1 = np.minimum(y0 + 1, h - 1)
+    wx = (x - x0).astype(np.float32); wy = (y - y0).astype(np.float32)
+    plan = ((y0 * w + x0).astype(np.int64),
+            (y0 * w + x1).astype(np.int64),
+            (y1 * w + x0).astype(np.int64),
+            (y1 * w + x1).astype(np.int64),
+            (1 - wx) * (1 - wy), wx * (1 - wy),
+            (1 - wx) * wy, wx * wy)
+    _POOL_PLANS[key] = plan
+    return plan
+
+
 def _pooled_multi(channels: list[np.ndarray], xs: np.ndarray,
                   ys: np.ndarray, k: int) -> list[np.ndarray]:
     """Pool several same-shape channels at once, sharing bilinear weights.
@@ -47,29 +75,38 @@ def _pooled_multi(channels: list[np.ndarray], xs: np.ndarray,
     """
     if k <= 1:
         return [_bilinear_at(ch, xs, ys) for ch in channels]
-    r = (k - 1) / 2
-    offs = np.arange(k, dtype=np.float32) - r
-    ox, oy = np.meshgrid(offs, offs)
-    X = (xs[None, :] + ox.ravel()[:, None]).astype(np.float32)
-    Y = (ys[None, :] + oy.ravel()[:, None]).astype(np.float32)
     h, w = channels[0].shape[-2:]
-    x = np.clip(X, 0, w - 1); y = np.clip(Y, 0, h - 1)
-    x0 = np.floor(x).astype(np.int32); y0 = np.floor(y).astype(np.int32)
-    x1 = np.minimum(x0 + 1, w - 1); y1 = np.minimum(y0 + 1, h - 1)
-    wx = (x - x0).astype(np.float32); wy = (y - y0).astype(np.float32)
-    w00 = (1 - wx) * (1 - wy); w10 = wx * (1 - wy)
-    w01 = (1 - wx) * wy; w11 = wx * wy
+    i00, i10, i01, i11, w00, w10, w01, w11 = _pool_plan(xs, ys, k, h, w)
     batched = channels[0].ndim == 3
+    if len(channels) == 4:
+        stack = np.stack(channels, axis=-1)
+        if batched:
+            flat = stack.reshape(stack.shape[0], -1, 4)
+            c00 = flat[:, i00, :]; c10 = flat[:, i10, :]
+            c01 = flat[:, i01, :]; c11 = flat[:, i11, :]
+            v = (c00 * w00[..., None] + c10 * w10[..., None]
+                 + c01 * w01[..., None] + c11 * w11[..., None])
+            out = v.mean(axis=1)                       # (N, K, 4)
+        else:
+            flat = stack.reshape(-1, 4)
+            c00 = flat[i00]; c10 = flat[i10]
+            c01 = flat[i01]; c11 = flat[i11]
+            v = (c00 * w00[..., None] + c10 * w10[..., None]
+                 + c01 * w01[..., None] + c11 * w11[..., None])
+            out = v.mean(axis=0)                       # (K, 4)
+        return [out[..., c] for c in range(4)]
     out = []
     for ch in channels:
+        flat = (ch.reshape(ch.shape[0], -1) if batched
+                else ch.reshape(-1))
         if batched:
-            c00 = ch[:, y0, x0]; c10 = ch[:, y0, x1]
-            c01 = ch[:, y1, x0]; c11 = ch[:, y1, x1]
+            c00 = flat[:, i00]; c10 = flat[:, i10]
+            c01 = flat[:, i01]; c11 = flat[:, i11]
             v = c00 * w00 + c10 * w10 + c01 * w01 + c11 * w11
             out.append(v.mean(axis=1))           # (N, offsets, K) -> (N, K)
         else:
-            c00 = ch[y0, x0]; c10 = ch[y0, x1]
-            c01 = ch[y1, x0]; c11 = ch[y1, x1]
+            c00 = flat[i00]; c10 = flat[i10]
+            c01 = flat[i01]; c11 = flat[i11]
             v = c00 * w00 + c10 * w10 + c01 * w01 + c11 * w11
             out.append(v.mean(axis=0))           # (K,)
     return out
@@ -156,13 +193,18 @@ def _trim_blue(arr: np.ndarray) -> np.ndarray:
     rgb = arr[:, :, :3].astype(int)
     blue = (rgb[:, :, 2] > rgb[:, :, 0] + BLUE_TRIM_THRESH) & \
            (rgb[:, :, 2] > rgb[:, :, 1] + BLUE_TRIM_THRESH)
-    if blue.any():
-        ys, xs = np.where(~blue)
-        if ys.size and (xs.min() > 0 or ys.min() > 0
-                        or xs.max() < arr.shape[1] - 1
-                        or ys.max() < arr.shape[0] - 1):
-            arr = arr[ys.min():ys.max() + 1,
-                      xs.min():xs.max() + 1]
+    content = ~blue
+    if content.any():
+        rows = content.any(axis=1)
+        cols = content.any(axis=0)
+        if rows.any() and cols.any():
+            y0 = rows.argmax()
+            y1 = rows.size - 1 - rows[::-1].argmax()
+            x0 = cols.argmax()
+            x1 = cols.size - 1 - cols[::-1].argmax()
+            if x0 > 0 or y0 > 0 or x1 < arr.shape[1] - 1 \
+                    or y1 < arr.shape[0] - 1:
+                arr = arr[y0:y1 + 1, x0:x1 + 1]
     return arr
 
 
