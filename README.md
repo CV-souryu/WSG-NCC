@@ -39,7 +39,7 @@ data/groups/group1/testset/cards/001.png
   3.	.../data/groups/group1/gallery/2B/6_2/XM_BROKEN_6_2.png	0.5412
 ```
 
-参数：`--codebook`（名字解析到 `data/codebooks/<name>.npz`，或直接给 `.npz` 路径）、
+参数：`--codebook`（名字解析到 `assets/codebooks/<name>.npz`，或直接给 `.npz` 路径）、
 `--k`（每图 top-k）、`--backend`（`cpu` / `gpu`，gpu 不可用时自动回退）、
 `--min-confidence`（低于该 top-1 分的不输出，默认 0.7；设 0 关闭过滤）、
 `--fit-width / --no-fit-width`（宽缩放 / cover，不传用码本 params）、
@@ -130,7 +130,7 @@ hue_bins=16, sat_bins=2, lig_bins=2, cells=(3,3), min_common_frac=0.9,
 top_fraction=0.8, cw=124, ch=240, trim_blue=True,
 shift_y=4, align="top-center", name=None, cache_path=None, force=False)`
 从 gallery 图片列表构建码本，返回 `CascadeCodebook`。给 `name` 会自动缓存到
-`data/codebooks/<name>.npz`；`cache_path` 可指定其它路径；`force=True` 强制重建。
+`assets/codebooks/<name>.npz`；`cache_path` 可指定其它路径；`force=True` 强制重建。
 
 > 直方图分箱固定为 **H16S2L2 × 3×3**（`hue_bins=16`、`sat_bins=2`、
 > `lig_bins=2`、`cells=(3,3)`）：WGSL GPU 内核硬编码这些维度，传其它值会在
@@ -166,7 +166,7 @@ refine=None, align=None, fit_width=None, unmask=None, region=None)`
 ```python
 cb = build_cascade_codebook(gallery_paths, name="cascade")   # list[Path]
 cb = load_cascade_codebook("cascade")                        # 按名字
-cb = load_cascade_codebook("data/codebooks/cascade.npz")     # 按路径
+cb = load_cascade_codebook("assets/codebooks/cascade.npz")   # 按路径
 top = recognize_cascade(cb, "query.png", k=5, top_n=20)      # 直接喂函数
 ```
 
@@ -266,7 +266,7 @@ from cascade_ncc import CascadeRecognizer
 meta = {
     key: info["title"]
     for key, info in json.loads(
-        Path("data/gallery_meta.json").read_text(encoding="utf-8")
+        Path("assets/gallery_meta.json").read_text(encoding="utf-8")
     ).items()
 }
 
@@ -328,25 +328,28 @@ for result in rec.recognize(cards, k=1):
 
 ## 数据组织
 
-**`data/` 整个 gitignore**——图片、码本、船名映射、测试集注解都随数据分发，不在仓库里。
+**`data/` 整个 gitignore**——图片、船名映射、测试集注解都随数据分发，不在仓库里。
+仓库随带 `assets/`：默认码本 `cascade.npz` 和识别元数据 `gallery_meta.json`。
 数据依赖的测试在缺数据时自动 skip。磁盘上的布局（约定见 `data/groups/README.md`）：
 
 ```
 data/
-├── groups/
-│   ├── group1/
-│   │   ├── gallery/        原图库（1/ 2/ 2B/，共 3362 张）
-│   │   └── testset/        测试集（cards/ + screens/ + alignment.json + summary.json）
-│   └── group2/             预留第二组
-├── codebooks/              命名码本 .npz（cascade.npz 等）
-├── ship_names.json         全局船名映射
-└── gallery_meta.json       识别元数据（key → {shipIndex, title}，自动生成）
+└── groups/
+    ├── group1/
+    │   ├── gallery/        原图库（1/ 2/ 2B/，共 3362 张）
+    │   └── testset/        测试集（cards/ + screens/ + alignment.json + summary.json）
+    └── group2/             预留第二组
+
+assets/
+├── codebooks/
+│   └── cascade.npz         默认全码本（随仓库分发）
+└── gallery_meta.json       识别元数据（key → {shipIndex, title}，随仓库分发）
 ```
 
 **新增一组**：建 `data/groups/group2/{gallery,testset}`，放入数据后用
 `build_cascade_codebook(sorted(Path("data/groups/group2/gallery").rglob("*.png")),
 name="cascade-group2")` 重建码本。注意码本记录的是**绝对路径**，gallery 移动或
-换组后必须重建（默认 `cascade.npz` 也一样）。
+换组后必须重建（默认 `assets/codebooks/cascade.npz` 也一样）。
 
 ## 目录
 
@@ -362,7 +365,10 @@ name="cascade-group2")` 重建码本。注意码本记录的是**绝对路径**�
 │   ├── _gpu.py                  # 共享 wgpu 样板（设备/模块/管线/绑定/派发）
 │   ├── _constants.py            # 共享常量（画布尺寸、阈值、灰度权重）
 │   └── cli.py                   # cascade-ncc 命令行入口
-├── data/                        # 整个 gitignored（图片/码本/船名映射，随数据分发）
+├── assets/                      # 随仓库分发：默认码本 + gallery_meta.json
+│   ├── codebooks/cascade.npz
+│   └── gallery_meta.json
+├── data/                        # 整个 gitignored（图片/船名映射/测试集，随数据分发）
 │   └── groups/group1/           # 原图库 + 测试集（见「数据组织」）
 ├── tests/
 │   ├── conftest.py              # 夹具 + 共享 helper（合成卡图）

@@ -37,8 +37,11 @@ def test_build_roundtrip(tmp_path):
     assert cb2.common8.dtype == bool
     assert cb2.params == cb.params
     for field in ("xs", "ys", "common", "hist", "xs8", "ys8", "samples8",
-                  "valid8", "common8", "normed8"):
+                  "valid8", "common8"):
         assert np.array_equal(getattr(cb2, field), getattr(cb, field))
+    # normed8 is not persisted; both sides recompute it lazily.
+    assert cb.normed8 is None and cb2.normed8 is None
+    assert np.array_equal(cb2.get_normed8(), cb.get_normed8())
 
 
 def test_build_cache_hit_and_force(tmp_path):

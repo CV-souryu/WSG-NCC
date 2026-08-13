@@ -60,7 +60,7 @@ from .primitives import (
 _LOG = logging.getLogger(__name__)
 
 CODEBOOK_DIR = (Path(__file__).resolve().parent.parent
-                / "data" / "codebooks")
+                / "assets" / "codebooks")
 
 
 def _canvas(cb) -> tuple[int, int]:
@@ -276,7 +276,7 @@ class CascadeCodebook:
     samples8: np.ndarray      # (N, S*3) sparse RGB NCC samples (R,G,B flat)
     valid8: np.ndarray        # (N, S*3) sparse RGB NCC validity (per channel)
     common8: np.ndarray       # (S*3,) sparse RGB NCC common mask
-    normed8: np.ndarray       # (N, C*3) normalized sparse RGB NCC vectors
+    normed8: np.ndarray | None   # lazy (N, C*3) normalized sparse RGB NCC vectors
     params: dict
     hist_mask: np.ndarray | None = None    # 576-d bucket mask (region activation)
     hist_cache: np.ndarray | None = None   # lazy region-restricted hist
@@ -303,7 +303,7 @@ class CascadeCodebook:
 def _cache_key(paths: list[Path], params: dict) -> str:
     payload = ("|".join(str(p.resolve()) for p in sorted(paths))
                + "|".join(f"{k}={params[k]}" for k in sorted(params))
-               + "|cascade3")
+               + "|cascade4")   # cascade4: normed8 no longer persisted
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -320,17 +320,17 @@ def _from_npz(data, params: dict | None = None) -> CascadeCodebook:
         samples8=np.asarray(data["samples8"]),
         valid8=np.asarray(data["valid8"]),
         common8=np.asarray(data["common8"], dtype=bool),
-        normed8=np.asarray(data["normed8"]),
+        normed8=None,   # recomputed lazily by get_normed8() on the CPU path
         params=params)
 
 
 def _to_npz(cb: CascadeCodebook, params_json: str, key: str) -> dict:
-    """npz payload for a codebook; the key set must stay stable for old caches."""
+    """npz payload for a codebook (normed8 is derived, so it is not stored)."""
     return {
         "paths": np.array([str(p) for p in cb.paths]),
         "xs": cb.xs, "ys": cb.ys, "common": cb.common, "hist": cb.hist,
         "xs8": cb.xs8, "ys8": cb.ys8, "samples8": cb.samples8,
-        "valid8": cb.valid8, "common8": cb.common8, "normed8": cb.normed8,
+        "valid8": cb.valid8, "common8": cb.common8,
         "params_json": np.array([params_json]), "key": key,
     }
 
@@ -445,14 +445,13 @@ def build_cascade_codebook(
     samples8 = np.stack(s8r)
     valid8 = np.stack(v8r)
     common8 = valid8.mean(axis=0) >= min_common_frac
-    normed8 = _normalize(samples8, common8)
     _LOG.info("cascade codebook built: %d imgs, hist %dd, NCC %d pts/%d "
               "common channels (%.1fs)",
               len(paths), hist.shape[1], len(xs8), int(common8.sum()),
               time.perf_counter() - t0)
 
     cb = CascadeCodebook(paths, xs, ys, common, hist, xs8, ys8,
-                         samples8, valid8, common8, normed8, params)
+                         samples8, valid8, common8, None, params)
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache, **_to_npz(cb, json.dumps(params), key))

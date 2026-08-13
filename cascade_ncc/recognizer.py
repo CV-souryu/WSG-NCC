@@ -451,7 +451,7 @@ class CascadeRecognizer(Generic[T]):
 
     Usage::
 
-        rec = CascadeRecognizer("data/codebooks/cascade.npz",
+        rec = CascadeRecognizer("assets/codebooks/cascade.npz",
                                 {".../XM_NORMAL_226.png": "航母 226", ...})
         top = rec.recognize(img_rgba_u8, k=3)     # [(value, conf, key), ...]
         tops = rec.recognize([img1, img2], k=3)   # list of those, one per image

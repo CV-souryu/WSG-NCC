@@ -243,7 +243,7 @@ def test_gpu_scorer_matches_cpu(gpu_context, cards):
     cpu_idx, cpu_sc = [], []
     for i in range(3):
         cand = np.argpartition(cb.hist @ feats_n[i], -20)[-20:]
-        sc = match_codebook(cb.normed8[cand], cb.samples8[cand],
+        sc = match_codebook(cb.get_normed8()[cand], cb.samples8[cand],
                             cb.valid8[cand], cb.common8,
                             srgb[i].astype(np.float32),
                             svalid[i].astype(bool), refine=50)
